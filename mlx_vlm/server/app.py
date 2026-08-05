@@ -771,12 +771,17 @@ def unload_model_sync():
             unloaded_any = True
 
     registry = _model_cache_registry()
-    for cache_group, _ in list(registry.items()):
+    # Collect only the group NAMES: a list of items() tuples would keep every
+    # cache dict — and the model weights — referenced until this function
+    # returns, so the weights would only be freed after the clear_cache()
+    # below and stay resident in the MLX buffer cache (GBs) indefinitely.
+    for cache_group in [group for group, _ in registry.items()]:
         unloaded_any = _unload_model_cache_group(cache_group) or unloaded_any
 
     runtime.response_generator = None
     runtime.apc_manager = None
     gc.collect()
+    mx.synchronize()
     mx.clear_cache()
     if unloaded_any:
         logger.info("Model caches cleared.")
