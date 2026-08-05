@@ -11,6 +11,10 @@ started with `--api-key`, all of them require
 `Authorization: Bearer <key>`; without it (the `start.sh` default) no auth
 is needed.
 
+`./serverctl.sh` in the repo root is a thin curl wrapper over these
+endpoints (`./serverctl.sh status`, `settings`,
+`apply context_size=150000`, `wait`, `stop`, ...).
+
 Inference itself goes through **`POST /v1/chat/completions`** — standard
 OpenAI chat-completions API (not documented here). Its only local quirks:
 responses carry an extra `timings` block, and while a model is being

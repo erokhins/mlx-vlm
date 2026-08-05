@@ -93,6 +93,8 @@ are fully KV-cached.)
 ## Server endpoints
 
 Full request/response examples for every endpoint: [JUNIE_API.md](JUNIE_API.md).
+`./serverctl.sh` wraps them for the command line (`status`, `settings`,
+`apply key=value`, `wait`, `stop`, ...).
 
 | URL | What |
 |---|---|
