@@ -18,6 +18,7 @@ import pytest
 
 from mlx_vlm.apc import (
     APCManager,
+    DiskBlockStore,
     _cache_entry_supports_block_apc,
     _cache_entry_supports_exact_apc,
     _clone_cache_entry_for_apc,
@@ -568,7 +569,9 @@ class TestExactModeQuantized:
         prompt_cache = [arrays, batch_kv, batch_q]
         assert all(_cache_entry_supports_exact_apc(c) for c in prompt_cache)
 
-        # Clone path: BatchKVCache collapses to KVCache; quant dequants to KVCache.
+        # Clone path: BatchKVCache collapses to KVCache; quant stays
+        # quantized (QuantizedKVCache) so store/resume skip the fp16 round
+        # trip.
         eval_targets: list = []
         cloned_bk = _clone_cache_entry_for_apc(
             batch_kv, min_capacity_tokens=None, eval_targets=eval_targets
@@ -581,7 +584,11 @@ class TestExactModeQuantized:
         assert len(cloned) == 3
         assert isinstance(cloned[0], ArraysCache)
         assert isinstance(cloned[1], KVCache)
-        assert isinstance(cloned[2], KVCache)
+        assert isinstance(cloned[2], QuantizedKVCache)
+        assert isinstance(cloned[2].keys, tuple)
+        assert cloned[2].offset == seq_len
+        assert cloned[2].group_size == GROUP_SIZE
+        assert cloned[2].bits == BITS
 
         manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
         stored = manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
@@ -1429,6 +1436,131 @@ class TestTurboQuantWarmRestoreLayout:
         )
         assert isinstance(warm[0], BatchTurboQuantKVCache)
         assert isinstance(warm[-1], BatchKVCache)
+
+
+# ---------------------------------------------------------------------------
+# Quantized session storage: anchors stay quantized end to end (no fp16
+# round trip on store, no requantization on resume).
+# ---------------------------------------------------------------------------
+
+
+class TestQuantizedSessionStorage:
+    def _hybrid_quant_prompt_cache(self, seq_len):
+        arrays = ArraysCache(2)
+        arrays.cache = [
+            mx.zeros((1, seq_len, D)),
+            mx.zeros((1, seq_len, D)),
+        ]
+        arrays.left_padding = mx.array([0])
+        quant = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
+        k, v = _rand_kv(batch=1, seq_len=seq_len)
+        quant.update_and_fetch(k, v)
+        mx.eval(quant.keys, quant.values)
+        return [arrays, quant], (k, v)
+
+    def test_session_anchor_stays_quantized(self):
+        seq_len = 2 * BLOCK_SIZE
+        token_ids = list(range(seq_len))
+        prompt_cache, (k, v) = self._hybrid_quant_prompt_cache(seq_len)
+
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        assert manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
+        assert len(manager._sessions) == 1
+        anchor = next(iter(manager._sessions.values())).kv_caches[1]
+        assert isinstance(anchor, QuantizedKVCache)
+        assert isinstance(anchor.keys, tuple)
+
+        # kv_bytes accounting handles the tuple layout and reflects the
+        # quantized (not fp16) size.
+        info = manager.stats_snapshot()["exact_sessions"][0]
+        assert 0 < info["kv_bytes"] < k.nbytes + v.nbytes
+
+    def test_session_resume_preserves_packed_bits(self):
+        seq_len = 2 * BLOCK_SIZE
+        token_ids = list(range(seq_len))
+        prompt_cache, _ = self._hybrid_quant_prompt_cache(seq_len)
+        ref_k, ref_v = prompt_cache[1].dequantize_for_apc()
+
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        assert manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
+        warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
+        assert matched == seq_len
+        assert warm is not None
+        restored = warm[1]
+        assert isinstance(restored, QuantizedKVCache)
+        assert restored.offset == seq_len
+        # Same packed bits as the live cache — bit-exact, no requant error.
+        rk, rv = restored.dequantize_for_apc()
+        assert _max_abs_error(rk, ref_k) == 0.0
+        assert _max_abs_error(rv, ref_v) == 0.0
+
+    def test_batch_quantized_merge_pads_rows(self):
+        lengths = (BLOCK_SIZE, 2 * BLOCK_SIZE)
+        rows, refs = [], []
+        for n in lengths:
+            c = QuantizedKVCache(group_size=GROUP_SIZE, bits=BITS)
+            k, v = _rand_kv(batch=1, seq_len=n)
+            c.update_and_fetch(k, v)
+            refs.append(c.dequantize_for_apc())
+            rows.append(c)
+
+        merged = BatchQuantizedKVCache.merge(rows)
+        assert isinstance(merged, BatchQuantizedKVCache)
+        assert merged._idx == max(lengths)
+        assert [int(x) for x in merged.left_padding.tolist()] == [
+            max(lengths) - n for n in lengths
+        ]
+        assert [int(x) for x in merged.offset.tolist()] == list(lengths)
+        mk, mv = merged.dequantize_for_apc()
+        for i, (n, (rk, rv)) in enumerate(zip(lengths, refs)):
+            pad = max(lengths) - n
+            assert _max_abs_error(mk[i : i + 1, :, pad:, :], rk) == 0.0
+            assert _max_abs_error(mv[i : i + 1, :, pad:, :], rv) == 0.0
+
+    def test_warm_batch_exact_multi_stays_quantized(self):
+        seq_len = 2 * BLOCK_SIZE
+        token_ids = list(range(seq_len))
+        prompt_cache, _ = self._hybrid_quant_prompt_cache(seq_len)
+
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE)
+        assert manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
+        warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
+        cfg = {"bits": BITS, "group_size": GROUP_SIZE, "scheme": "uniform"}
+        batch, prefix = make_warm_batch_exact_cache_multi(
+            [warm], [matched], kv_quant_config=cfg
+        )
+        assert batch is not None
+        assert prefix == seq_len
+        assert isinstance(batch[0], ArraysCache)
+        assert isinstance(batch[1], BatchQuantizedKVCache)
+        assert isinstance(batch[1].keys, tuple)
+
+    def test_disk_quant_kv_roundtrip(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("APC_DISK_EXACT_SCOPE", "all")
+        seq_len = 2 * BLOCK_SIZE
+        token_ids = list(range(seq_len))
+        prompt_cache, _ = self._hybrid_quant_prompt_cache(seq_len)
+        ref_k, ref_v = prompt_cache[1].dequantize_for_apc()
+
+        disk = DiskBlockStore(tmp_path, namespace="unit")
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE, disk=disk)
+        assert manager.store_exact_cache(token_ids, prompt_cache, extra_hash=0)
+        disk._q.join()
+        manager.close()
+
+        disk = DiskBlockStore(tmp_path, namespace="unit")
+        manager = APCManager(num_blocks=4, block_size=BLOCK_SIZE, disk=disk)
+        warm, matched = manager.lookup_exact_cache(token_ids + [999], extra_hash=0)
+        assert matched == seq_len
+        assert warm is not None
+        restored = warm[1]
+        assert isinstance(restored, QuantizedKVCache)
+        assert restored.group_size == GROUP_SIZE
+        assert restored.bits == BITS
+        rk, rv = restored.dequantize_for_apc()
+        assert _max_abs_error(rk, ref_k) == 0.0
+        assert _max_abs_error(rv, ref_v) == 0.0
+        manager.close()
 
 
 @pytest.mark.skipif(

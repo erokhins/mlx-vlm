@@ -190,11 +190,12 @@ class TestSnapshotPromptCacheRow:
         snap = snapshot_prompt_cache_row([batch_kv, batch_q], batch_idx=0)
         assert snap is not None
         assert len(snap) == 2
-        # APC core never sees Batch* types
+        # APC core never sees Batch* types; quant layers stay quantized.
         assert not isinstance(snap[0], BatchKVCache)
         assert not isinstance(snap[1], BatchQuantizedKVCache)
         assert isinstance(snap[0], KVCache)
-        assert isinstance(snap[1], KVCache)
+        assert isinstance(snap[1], QuantizedKVCache)
+        assert isinstance(snap[1].keys, tuple)
         assert snap[0].offset == seq_len
         assert snap[1].offset == seq_len
 
@@ -425,7 +426,8 @@ class TestAlwaysExtractSemantics:
         assert isinstance(row[0], QuantizedKVCache)
         cloned = _clone_prompt_cache_for_apc(row)
         assert cloned is not None
-        assert isinstance(cloned[0], KVCache)
+        assert isinstance(cloned[0], QuantizedKVCache)
+        assert isinstance(cloned[0].keys, tuple)
 
     def test_snapshot_equivalent_for_b1_whether_or_not_batch(self):
         from mlx_vlm.apc import snapshot_prompt_cache_row

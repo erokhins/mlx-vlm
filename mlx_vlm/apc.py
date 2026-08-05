@@ -291,14 +291,43 @@ def _clone_cache_entry_for_apc(
     )
 
 
+def _kv_quant_policy_from_env() -> Optional[dict]:
+    """The server's KV-quantization config, for store-time snapshot clones.
+
+    Mirrors the env vars the server generation reads (KV_BITS,
+    KV_GROUP_SIZE, QUANTIZED_KV_START). Uniform scheme only — TurboQuant
+    snapshots stay float.
+    """
+    try:
+        bits = float(os.environ.get("KV_BITS", 0) or 0)
+    except ValueError:
+        return None
+    if bits <= 0 or bits != int(bits):
+        return None
+    if os.environ.get("KV_QUANT_SCHEME", "uniform").lower() != "uniform":
+        return None
+    try:
+        group_size = int(os.environ.get("KV_GROUP_SIZE", "64") or 64)
+        start = int(os.environ.get("QUANTIZED_KV_START", "0") or 0)
+    except ValueError:
+        return None
+    return {"bits": int(bits), "group_size": group_size, "start": start}
+
+
 def _clone_prompt_cache_for_apc(
     prompt_cache: Sequence[Any],
     *,
     min_capacity_tokens: Optional[int] = None,
+    quantize_kv: bool = False,
 ) -> Optional[List[Any]]:
+    from .models import cache as lm
+    from .models.cache import should_quantize_kv_layer
+
+    policy = _kv_quant_policy_from_env() if quantize_kv else None
+    num_entries = len(prompt_cache)
     eval_targets: List[mx.array] = []
     out: List[Any] = []
-    for c in prompt_cache:
+    for i, c in enumerate(prompt_cache):
         copied = _clone_cache_entry_for_apc(
             c,
             min_capacity_tokens=min_capacity_tokens,
@@ -306,6 +335,35 @@ def _clone_prompt_cache_for_apc(
         )
         if copied is None:
             return None
+        if (
+            policy is not None
+            and type(copied) is lm.KVCache
+            and copied.keys is not None
+            and int(copied.offset) >= policy["start"]
+            and should_quantize_kv_layer(i, num_entries)
+        ):
+            # Store the snapshot quantized: the same conversion the live
+            # cache undergoes past QUANTIZED_KV_START, so a session anchor
+            # holds ~half the bytes and resume skips the requantization.
+            # (The prompt batch may still be float at harvest time — the
+            # live path converts on the generation-batch side.)
+            off = int(copied.offset)
+            q = lm.QuantizedKVCache(
+                group_size=policy["group_size"], bits=policy["bits"]
+            )
+            q.keys = mx.quantize(
+                copied.keys[..., :off, :],
+                group_size=policy["group_size"],
+                bits=policy["bits"],
+            )
+            q.values = mx.quantize(
+                copied.values[..., :off, :],
+                group_size=policy["group_size"],
+                bits=policy["bits"],
+            )
+            q.offset = off
+            eval_targets.extend([*q.keys, *q.values])
+            copied = q
         out.append(copied)
     if eval_targets:
         mx.eval(eval_targets)
@@ -348,7 +406,10 @@ def _session_layer_kinds(caches: Sequence[Any]) -> Optional[List[str]]:
 
     kinds: List[str] = []
     for c in caches:
-        if type(c) is lm.KVCache:
+        if type(c) is lm.KVCache or type(c) is lm.QuantizedKVCache:
+            # Both are per-token sliceable along the seq axis (quantized
+            # packing is on the head-dim axis), so either can serve as the
+            # shared session anchor.
             kinds.append("kv")
         elif type(c) is lm.ArraysCache:
             kinds.append("state")
@@ -767,6 +828,11 @@ def _safetensors_dtype_info(dtype: str):
     mapping = {
         "F16": (np.dtype("<f2"), mx.float16, None),
         "F32": (np.dtype("<f4"), mx.float32, None),
+        # Quantized KV snapshots (packed words) and integer side arrays
+        # (left_padding/lengths of ArraysCache states).
+        "U32": (np.dtype("<u4"), mx.uint32, None),
+        "I32": (np.dtype("<i4"), mx.int32, None),
+        "I64": (np.dtype("<i8"), mx.int64, None),
     }
     return mapping.get(dtype)
 
@@ -1518,6 +1584,34 @@ class DiskBlockStore:
             c.values = v
             c.offset = off
             eval_targets.extend([k, v])
+            return c
+
+        if kind == "quant_kv":
+            try:
+                group_size = int(metadata.get(f"{prefix}_group_size", "64"))
+                bits = int(metadata.get(f"{prefix}_bits", "8"))
+                off = int(metadata.get(f"{prefix}_offset", "0"))
+            except (TypeError, ValueError):
+                return None
+            c = lm_cache.QuantizedKVCache(group_size=group_size, bits=bits)
+            if metadata.get(f"{prefix}_empty", "0") == "1":
+                c.offset = off
+                return c
+            keys: List[mx.array] = []
+            values: List[mx.array] = []
+            for name, dest in (("k", keys), ("v", values)):
+                for j in range(3):
+                    entry = tensor_entries.get(f"{prefix}_{name}{j}")
+                    if entry is None:
+                        return None
+                    part = _read_safetensors_tensor(path, data_start, entry)
+                    if part is None:
+                        return None
+                    dest.append(part)
+            c.keys = tuple(keys)
+            c.values = tuple(values)
+            c.offset = off or int(keys[0].shape[2])
+            eval_targets.extend(keys + values)
             return c
 
         if kind == "rotating_kv":
@@ -2656,6 +2750,20 @@ class DiskBlockStore:
             arrays[f"{prefix}_v"] = c.values[..., :off, :]
             return True
 
+        if isinstance(c, lm_cache.QuantizedKVCache):
+            off = int(getattr(c, "offset", 0) or 0)
+            metadata[f"{prefix}_kind"] = "quant_kv"
+            metadata[f"{prefix}_offset"] = str(off)
+            metadata[f"{prefix}_group_size"] = str(int(c.group_size))
+            metadata[f"{prefix}_bits"] = str(int(c.bits))
+            if c.keys is None or c.values is None or off <= 0:
+                metadata[f"{prefix}_empty"] = "1"
+                return True
+            for name, parts in (("k", c.keys), ("v", c.values)):
+                for j, part in enumerate(parts):
+                    arrays[f"{prefix}_{name}{j}"] = part[..., :off, :]
+            return True
+
         if isinstance(c, lm_cache.RotatingKVCache):
             metadata[f"{prefix}_kind"] = "rotating_kv"
             metadata[f"{prefix}_keep"] = str(int(getattr(c, "keep", 0) or 0))
@@ -3184,7 +3292,9 @@ class APCManager:
                         if session_kinds is not None and any(
                             k == "state" for k in session_kinds
                         ):
-                            promoted = _clone_prompt_cache_for_apc(prompt_cache)
+                            promoted = _clone_prompt_cache_for_apc(
+                                prompt_cache, quantize_kv=True
+                            )
                             if promoted is not None:
                                 self._store_exact_session(
                                     stored_tokens,
@@ -3209,7 +3319,9 @@ class APCManager:
                         # races here, the restored tensors are still valid; only
                         # the hit counter lands in the new stats window.
                         if self._exact_cache_max > 0:
-                            storage_copy = _clone_prompt_cache_for_apc(prompt_cache)
+                            storage_copy = _clone_prompt_cache_for_apc(
+                                prompt_cache, quantize_kv=True
+                            )
                             if storage_copy is not None:
                                 promote_key = _sequence_hash(
                                     stored_tokens, extra_hash, self.block_size
@@ -3400,6 +3512,23 @@ class APCManager:
             if kv is not None:
                 if kv.keys is None or kv.values is None:
                     return None
+                if isinstance(kv.keys, tuple):
+                    # Quantized anchor: slice each (packed, scales, biases)
+                    # part along the seq axis. No capacity padding —
+                    # QuantizedKVCache grows its buffers itself.
+                    c = type(kv)(
+                        group_size=int(kv.group_size), bits=int(kv.bits)
+                    )
+                    c.keys = tuple(
+                        _copy_mlx_array(p[..., :prefix_len, :]) for p in kv.keys
+                    )
+                    c.values = tuple(
+                        _copy_mlx_array(p[..., :prefix_len, :]) for p in kv.values
+                    )
+                    c.offset = prefix_len
+                    eval_targets.extend([*c.keys, *c.values])
+                    out.append(c)
+                    continue
                 c = type(kv)()
                 keys = _copy_mlx_array(kv.keys[..., :prefix_len, :])
                 values = _copy_mlx_array(kv.values[..., :prefix_len, :])
@@ -3449,7 +3578,7 @@ class APCManager:
             # store as the pinned seed prefix, which is the only snapshot
             # persisted to disk under APC_DISK_EXACT_SCOPE=pinned.
             pin_pending = self._pin_next_session_store
-        copied = _clone_prompt_cache_for_apc(prompt_cache)
+        copied = _clone_prompt_cache_for_apc(prompt_cache, quantize_kv=True)
         if copied is None:
             types = [type(c).__name__ for c in prompt_cache]
             logger.warning(
@@ -3801,7 +3930,7 @@ class APCManager:
                         "checkpoints": sorted(s.checkpoints.keys()),
                         "pinned": s.pinned,
                         "kv_bytes": sum(
-                            int(c.keys.nbytes) + int(c.values.nbytes)
+                            int(c.nbytes)
                             for c in s.kv_caches
                             if c is not None and c.keys is not None
                         ),
@@ -4330,7 +4459,9 @@ def snapshot_prompt_cache_row(
         if row is None:
             return None
         source = row
-    return _clone_prompt_cache_for_apc(source, min_capacity_tokens=min_capacity_tokens)
+    return _clone_prompt_cache_for_apc(
+        source, min_capacity_tokens=min_capacity_tokens, quantize_kv=True
+    )
 
 
 def layer_kv_for_apc(

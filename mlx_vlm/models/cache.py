@@ -1896,6 +1896,56 @@ class BatchQuantizedKVCache(_BaseCache):
         self.offset -= n
         return n
 
+    @classmethod
+    def merge(cls, caches):
+        """Merge single-row ``QuantizedKVCache`` entries into a batch cache.
+
+        Mirrors ``BatchKVCache.merge`` for the (packed, scales, biases)
+        tuple layout; all inputs must share group_size/bits.
+        """
+        group_size = int(getattr(caches[0], "group_size", 64))
+        bits = int(getattr(caches[0], "bits", 8))
+        if any(
+            int(getattr(c, "group_size", group_size)) != group_size
+            or int(getattr(c, "bits", bits)) != bits
+            for c in caches
+        ):
+            raise ValueError(
+                "Cannot merge quantized KV caches with mixed quantization configs."
+            )
+        lengths = [int(c.offset) for c in caches]
+        max_length = max(lengths)
+
+        if max_length == 0:
+            return cls([0] * len(caches), group_size=group_size, bits=bits)
+
+        padding = [max_length - length for length in lengths]
+        B = len(caches)
+        template = next(c for c in caches if c.keys is not None)
+        keys = tuple(
+            mx.zeros((B, part.shape[1], max_length, part.shape[3]), dtype=part.dtype)
+            for part in template.keys
+        )
+        values = tuple(
+            mx.zeros((B, part.shape[1], max_length, part.shape[3]), dtype=part.dtype)
+            for part in template.values
+        )
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            if c.keys is None:
+                continue
+            off = int(c.offset)
+            for dst, src in zip(keys, c.keys):
+                dst[i : i + 1, :, p : p + off] = src[..., :off, :]
+            for dst, src in zip(values, c.values):
+                dst[i : i + 1, :, p : p + off] = src[..., :off, :]
+
+        cache = cls(padding, group_size=group_size, bits=bits)
+        cache.keys = keys
+        cache.values = values
+        cache.offset += max_length
+        cache._idx = max_length
+        return cache
+
     def empty(self):
         return self.keys is None
 

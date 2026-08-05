@@ -382,6 +382,37 @@ class ChunkedKVCacheCloneAdapter:
         return lm.BatchKVCache.merge(caches)
 
 
+class QuantizedKVCacheCloneAdapter:
+    """Clone quantized KV layers without dequantizing.
+
+    Keeps sessions/exact snapshots in the (packed, scales, biases) tuple
+    form so store and resume avoid full fp16 materialization of the anchor
+    (and the requantization on resume becomes a no-op).
+    """
+
+    capability = Capability.PAGEABLE
+
+    def clone(self, c, *, min_capacity_tokens, eval_targets):
+        from .models import cache as lm
+
+        copy, _ = _apc_array_helpers()
+        out = lm.QuantizedKVCache(group_size=int(c.group_size), bits=int(c.bits))
+        off = int(getattr(c, "offset", 0) or 0)
+        if c.keys is not None and c.values is not None and off > 0:
+            # No capacity padding: QuantizedKVCache.update_and_fetch grows
+            # its buffers itself.
+            out.keys = tuple(copy(part[..., :off, :]) for part in c.keys)
+            out.values = tuple(copy(part[..., :off, :]) for part in c.values)
+            out.offset = off
+            eval_targets.extend([*out.keys, *out.values])
+        return out
+
+    def merge_rows(self, caches, prefix_lens):
+        from .models import cache as lm
+
+        return lm.BatchQuantizedKVCache.merge(caches)
+
+
 class ArraysCacheCloneAdapter:
     capability = Capability.CHECKPOINT
 
@@ -441,6 +472,7 @@ def _clone_rules():
 
         _CLONE_RULES = [
             (lm.KVCache, KVCacheCloneAdapter()),
+            (lm.QuantizedKVCache, QuantizedKVCacheCloneAdapter()),
             (lm.RotatingKVCache, RotatingKVCacheCloneAdapter()),
             (lm.ChunkedKVCache, ChunkedKVCacheCloneAdapter()),
             (lm.ArraysCache, ArraysCacheCloneAdapter()),
@@ -483,6 +515,10 @@ def clone_cache_entry(c, *, min_capacity_tokens, eval_targets):
         if c.empty():
             if isinstance(c, lm.BatchRotatingKVCache):
                 return lm.RotatingKVCache(max_size=int(c.max_size))
+            if isinstance(c, lm.BatchQuantizedKVCache):
+                return lm.QuantizedKVCache(
+                    group_size=int(c.group_size), bits=int(c.bits)
+                )
             return lm.KVCache()
         return clone_cache_entry(
             c.extract(0),
