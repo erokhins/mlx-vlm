@@ -85,6 +85,7 @@ are fully KV-cached.)
 | `~/.local/share/junie-local/models/` | model weights, HF-hub layout (`models--mlx-community--Qwen3.6-27B-4bit`, `...-MTP-4bit`, plus `.models--*.installed` completion markers) |
 | `~/.local/share/junie-local/incomplete_downloads/` | in-progress downloads (kept for resume, removed when done) |
 | `~/.local/share/junie-local/apc-cache/` | APC disk tier — holds only the pinned seed snapshot (~1 GB) so it survives restarts |
+| `~/.local/share/junie-local/server-config.json` | persistent server settings (model, context length, KV quantization, auto-unload); created with defaults on first start, updated by `POST /apply_settings` |
 | `<repo>/.uv/bin/uv` | `uv` binary (only when not already installed on the machine) |
 | `<repo>/.uv/python/` | uv-managed CPython 3.13 (only when the machine has no suitable Python) |
 | `~/.junie/models/local-qwen3.6-27b-4bit-vlm.json` | Junie model descriptor pointing at this server |

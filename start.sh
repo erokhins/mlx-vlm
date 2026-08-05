@@ -36,16 +36,22 @@ fi
 # Everything below goes to mlx_server.log in the repo dir (gitignored;
 # truncated on each start).
 exec >"$LOG_FILE" 2>&1
-MODEL_ID="mlx-community/Qwen3.6-27B-4bit"
-# Multi-token-prediction speculative-decoding drafter for the model above.
-# It has no standalone language_model head, so it must be passed as
-# --draft-model, never requested directly as a chat "model".
+
+# These ids drive the weight download and the Junie descriptor below. The
+# model the server actually serves (and its MTP speculative-decoding
+# drafter) is decided by the persistent config file (JUNIE_SERVER_CONFIG,
+# see section 4), whose defaults are these same ids — keep them in sync
+# with DEFAULT_CONFIG in mlx_vlm/server/junie/config.py.
+#
+# Drafter notes: it has no standalone language_model head, so it is only
+# ever a draft model, never requested directly as a chat "model".
 # Measured ~1.45-1.6x decode speedup at 2.24 accepted tokens/round; the
 # drafter itself costs only ~9% of a round — the rest is the 3-token verify
-# forward. Do not add --draft-block-size: the sweep (research/mtp-overhead)
-# showed the configured depth 3 is optimal (2/4/5/6 are all slower) and the
-# adaptive controller already handles bursts. Per-request acceptance shows
-# up in the log as "Speculative decode: ... accepted_tokens_per_round=".
+# forward. The configured draft depth 3 is optimal (research/mtp-overhead:
+# 2/4/5/6 are all slower) and the adaptive controller already handles
+# bursts. Per-request acceptance shows up in the log as
+# "Speculative decode: ... accepted_tokens_per_round=".
+MODEL_ID="mlx-community/Qwen3.6-27B-4bit"
 DRAFT_MODEL_ID="mlx-community/Qwen3.6-27B-MTP-4bit"
 
 # ---------------------------------------------------------------------------
@@ -259,6 +265,12 @@ fi
 export HF_HUB_CACHE="$MODELS_DIR"
 export HF_HUB_OFFLINE=1
 
+# Persistent settings (model, max_context_length, kv_quantization,
+# auto_unload_time). The server reads this file before loading the model
+# and rewrites it whenever POST /apply_settings succeeds, so settings
+# survive restarts. Created with defaults on first start.
+export JUNIE_SERVER_CONFIG="$BASE_DIR/server-config.json"
+
 # Make sure "import mlx_vlm" resolves to this checkout's sources, ahead of
 # any installed package.
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -302,12 +314,11 @@ SEED_REQUEST="$SCRIPT_DIR/research/junie.json"
 # ~1000 tok/s at 24.8 GB peak on a 12.6k prompt). If a quality issue shows
 # up on real workloads, first try MLX_VLM_INT8_SCOPE=mlp (keeps attention
 # numerics untouched), then drop --int8-prefill entirely.
+# The model and drafter are NOT passed here — the server picks them up
+# from the config file (JUNIE_SERVER_CONFIG above).
 exec "$PYTHON_BIN" -m mlx_vlm.server \
   --host 0.0.0.0 \
   --port "$PORT" \
-  --model "$MODEL_ID" \
-  --draft-model "$DRAFT_MODEL_ID" \
-  --draft-kind mtp \
   --int8-prefill \
   --prefill-step-size 4096 \
   --preserve-thinking \

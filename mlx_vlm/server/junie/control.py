@@ -34,6 +34,11 @@ from .lifecycle import (
     PHASE_WARMING_UP,
     lifecycle,
 )
+from .config import (
+    DEFAULT_KV_QUANT_BITS,
+    initialize_from_config,
+    save_settings,
+)
 from .memory import memory_stats
 from .state import metrics_in_flight, reload_lock, serving_config
 from .watchdog import (
@@ -43,8 +48,6 @@ from .watchdog import (
 )
 
 logger = logging.getLogger("mlx_vlm.server")
-
-DEFAULT_KV_QUANT_BITS = 8
 
 _ALLOWED_SETTINGS_KEYS = {
     "model_name",
@@ -72,6 +75,9 @@ def start_background_model_load(deps) -> None:
     get_cached_model() rejects inference from other threads with 503 until
     this finishes (see lifecycle.busy_phase_for_caller).
     """
+    # The persisted config (JUNIE_SERVER_CONFIG), not command-line flags,
+    # decides the model and serving settings when present.
+    initialize_from_config()
     has_preload = any(
         os.environ.get(name)
         for name in (
@@ -283,7 +289,9 @@ def _apply_env(env_updates: dict) -> None:
             os.environ[key] = value
 
 
-def _apply_settings_worker(deps, model_path, adapter_path, env_updates) -> None:
+def _apply_settings_worker(
+    deps, model_path, adapter_path, env_updates, config_updates
+) -> None:
     lifecycle.set_loader_thread(threading.get_ident())
     try:
         logger.info("Applying settings: %s (model=%s)", env_updates, model_path)
@@ -297,6 +305,9 @@ def _apply_settings_worker(deps, model_path, adapter_path, env_updates) -> None:
             serving_config["model_path"] = model_path
             serving_config["adapter_path"] = adapter_path
             serving_config["loaded_at"] = time.time()
+        # Persist only after the settings actually took effect, so a failed
+        # reload does not poison the next restart.
+        save_settings(config_updates)
     except Exception as e:
         logger.exception("apply_settings reload failed")
         lifecycle.set_phase(PHASE_ERROR, f"apply_settings failed: {e}")
@@ -375,6 +386,7 @@ def register_control_routes(app, deps) -> None:
         if requested_model is None and not env_updates:
             raise _settings_error("No settings provided.")
         force = bool(body.get("force"))
+        config_updates = {k: v for k, v in body.items() if k != "force"}
         needs_restart = requested_model is not None or any(
             key in _RESTART_ENV_KEYS for key in env_updates
         )
@@ -389,6 +401,7 @@ def register_control_routes(app, deps) -> None:
             # auto_unload_time only: applies live, nothing to restart.
             try:
                 _apply_env(env_updates)
+                save_settings(config_updates)
             finally:
                 reload_lock.release()
             return {
@@ -427,7 +440,7 @@ def register_control_routes(app, deps) -> None:
             lifecycle.set_phase(PHASE_RESTARTING, "applying new settings")
             Thread(
                 target=_apply_settings_worker,
-                args=(deps, target_model, adapter_path, env_updates),
+                args=(deps, target_model, adapter_path, env_updates, config_updates),
                 daemon=True,
                 name="apply-settings",
             ).start()

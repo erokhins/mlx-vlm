@@ -161,6 +161,14 @@ serving in the background (unload → apply → reload → seed re-warmup) —
 model takes on the order of a minute. `auto_unload_time` alone applies
 live, without a restart.
 
+Applied settings are **persisted** to
+`~/.local/share/junie-local/server-config.json` (only after they took
+effect), so they survive server restarts. That file — not `start.sh`
+flags — decides which model is served and with which settings; it is
+created with defaults on first start and can also be edited by hand while
+the server is stopped (it additionally holds `draft_model`/`draft_kind`,
+which are not settable through this endpoint).
+
 Request — any subset of:
 
 | Field | Type | Effect |
