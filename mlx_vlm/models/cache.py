@@ -1922,6 +1922,12 @@ class BatchQuantizedKVCache(_BaseCache):
         padding = [max_length - length for length in lengths]
         B = len(caches)
         template = next(c for c in caches if c.keys is not None)
+        if not isinstance(template.keys, tuple):
+            raise TypeError(
+                "BatchQuantizedKVCache.merge expects quantized rows with "
+                f"(packed, scales, biases) keys; got {type(template).__name__} "
+                "with dense keys"
+            )
         keys = tuple(
             mx.zeros((B, part.shape[1], max_length, part.shape[3]), dtype=part.dtype)
             for part in template.keys

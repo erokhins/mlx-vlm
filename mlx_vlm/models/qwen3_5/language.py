@@ -10,7 +10,7 @@ from ..base import (
     create_attention_mask,
     scaled_dot_product_attention,
 )
-from ..cache import ArraysCache, KVCache
+from ..cache import ArraysCache, KVCache, QuantizedKVCache
 from ..rope_utils import MRoPERotaryEmbedding
 from ..rope_utils import apply_multimodal_rotary_pos_emb as _apply_mrope
 from .config import ModelConfig, TextConfig
@@ -734,6 +734,14 @@ def _extract_row_cache(cache_entry, row: int):
         return cache_entry.extract(row)
 
     if hasattr(cache_entry, "left_padding"):
+        # Empty batch cache: give the row a fresh single-row cache of the
+        # matching kind — the post-row-forward merge rebuilds the batch
+        # cache from these, so a quantized batch must get quantized rows.
+        if hasattr(cache_entry, "bits"):
+            return QuantizedKVCache(
+                group_size=int(cache_entry.group_size),
+                bits=int(cache_entry.bits),
+            )
         row_cache = KVCache()
         return row_cache
 
