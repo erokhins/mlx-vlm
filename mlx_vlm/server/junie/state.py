@@ -5,13 +5,12 @@ from threading import Lock
 from ..runtime import runtime
 
 # Serializes model-serving reconfiguration: /apply_settings restarts and
-# idle auto-unloads (watchdog.py) take this lock so they never overlap.
+# guarded reloads take this lock so they never overlap.
 reload_lock = Lock()
 
 # Model/adapter the server is configured to serve. Set by the startup loader
 # and updated by /apply_settings, so a model restart knows what to reload
 # even after MLX_VLM_PRELOAD_MODEL has been popped from the environment.
-# loaded_at anchors the idle clock for auto-unload.
 serving_config = {"model_path": None, "adapter_path": None, "loaded_at": None}
 
 

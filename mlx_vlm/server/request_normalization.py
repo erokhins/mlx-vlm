@@ -9,6 +9,7 @@ from ..generate import (
 )
 from ..structured import build_json_schema_logits_processor
 from .generation import (
+    MAX_TOKENS_HARD_CAP,
     GenerationArguments,
     get_server_enable_thinking,
     get_server_max_tokens,
@@ -143,6 +144,7 @@ def _build_gen_args(
         max_tokens = getattr(request, "max_output_tokens", None)
     if max_tokens is None:
         max_tokens = get_server_max_tokens()
+    max_tokens = min(int(max_tokens), MAX_TOKENS_HARD_CAP)
     logit_bias = getattr(request, "logit_bias", None)
     if logit_bias is not None and isinstance(logit_bias, dict):
         logit_bias = {int(k): v for k, v in logit_bias.items()}

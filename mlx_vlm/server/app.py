@@ -49,7 +49,7 @@ from .runtime import ModelCacheRegistry, runtime
 from .schemas import ChatLogprobContent, ModelsResponse, TopLogprob
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
-DEFAULT_SERVER_PORT = 8080
+DEFAULT_SERVER_PORT = 8085
 SERVER_API_KEY_ENV = "MLX_VLM_SERVER_API_KEY"
 
 logger = logging.getLogger("mlx_vlm.server")
@@ -518,6 +518,22 @@ def _audio_cache_group(model_kind: str) -> str:
     return "audio"
 
 
+def _resolve_model_alias(model_path: str) -> str:
+    """Map a request model id through MLX_VLM_MODEL_ALIASES.
+
+    Format: "alias=target[,alias=target...]". An aliased id resolves to the
+    served model instead of triggering a load of a model by that literal id.
+    """
+    raw = os.environ.get("MLX_VLM_MODEL_ALIASES")
+    if not raw or not model_path:
+        return model_path
+    for pair in raw.split(","):
+        alias, sep, target = pair.partition("=")
+        if sep and alias.strip() == model_path and target.strip():
+            return target.strip()
+    return model_path
+
+
 def get_cached_model(
     model_path: str,
     adapter_path=_INHERIT_ADAPTER,
@@ -528,6 +544,7 @@ def get_cached_model(
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+    model_path = _resolve_model_alias(model_path)
     busy_phase = lifecycle.busy_phase_for_caller()
     if busy_phase is not None:
         raise HTTPException(
@@ -889,6 +906,16 @@ def models_endpoint():
         if all(model["id"] != loaded for model in models):
             models.append(
                 {"id": loaded, "object": "model", "created": int(time.time())}
+            )
+
+    # Aliased ids resolve to the served model (see _resolve_model_alias);
+    # list them so clients that validate against /v1/models can use them.
+    for pair in os.environ.get("MLX_VLM_MODEL_ALIASES", "").split(","):
+        alias, sep, _target = pair.partition("=")
+        alias = alias.strip()
+        if sep and alias and all(model["id"] != alias for model in models):
+            models.append(
+                {"id": alias, "object": "model", "created": int(time.time())}
             )
 
     response = {"object": "list", "data": models}

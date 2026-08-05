@@ -94,8 +94,16 @@ def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
 
+# Hard ceiling on tokens generated per request; neither the request's
+# max_tokens nor the server's MLX_VLM_MAX_TOKENS default can exceed it.
+MAX_TOKENS_HARD_CAP = 12000
+
+
 def get_server_max_tokens():
-    return int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS))
+    return min(
+        int(os.environ.get("MLX_VLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
+        MAX_TOKENS_HARD_CAP,
+    )
 
 
 def get_token_queue_timeout():

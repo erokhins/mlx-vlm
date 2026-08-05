@@ -42,11 +42,6 @@ from .config import (
 )
 from .memory import memory_stats
 from .state import metrics_in_flight, reload_lock, serving_config
-from .watchdog import (
-    AUTO_UNLOAD_TIME_ENV,
-    auto_unload_seconds,
-    ensure_idle_watchdog,
-)
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -54,12 +49,10 @@ _ALLOWED_SETTINGS_KEYS = {
     "model_name",
     "max_context_length",
     "kv_quantization",
-    "auto_unload_time",
     "force",
 }
 
-# Env updates that require a model-serving restart to take effect;
-# everything else (auto_unload_time) is applied live.
+# Env updates that require a model-serving restart to take effect.
 _RESTART_ENV_KEYS = {"MAX_KV_SIZE", "KV_BITS"}
 
 
@@ -85,7 +78,7 @@ def start_background_model_load(deps) -> None:
     runtime.on_generation_corrupted = (
         lambda reason: _restart_after_corruption(deps, reason)
     )
-    # Reloads of the configured model (after an idle auto-unload) must go
+    # Reloads of the configured model (after a manual /unload) must go
     # through the guarded background loader: the lazy in-request load
     # produced corrupted model state in ~90% of observed cycles.
     runtime.on_text_model_load = (
@@ -112,7 +105,6 @@ def start_background_model_load(deps) -> None:
         ).start()
     else:
         lifecycle.set_phase(PHASE_READY)
-    ensure_idle_watchdog(deps)
 
 
 def _load_configured_models(deps) -> None:
@@ -194,11 +186,11 @@ def _reload_configured_model_guarded(deps, model_path: str) -> None:
         return
     if reload_lock.acquire(blocking=False):
         logger.info(
-            "Configured model requested after idle unload; reloading it on "
+            "Configured model requested after an unload; reloading it on "
             "the guarded background path."
         )
         lifecycle.set_phase(
-            PHASE_LOADING_MODEL, f"reloading {model_path} after idle unload"
+            PHASE_LOADING_MODEL, f"reloading {model_path} after an unload"
         )
         Thread(
             target=_apply_settings_worker,
@@ -210,12 +202,12 @@ def _reload_configured_model_guarded(deps, model_path: str) -> None:
                 {},
             ),
             daemon=True,
-            name="idle-reload",
+            name="unload-reload",
         ).start()
     raise HTTPException(
         status_code=503,
         detail=(
-            "Model is loading after an idle unload; retry shortly "
+            "Model is loading after an unload; retry shortly "
             "(poll GET /status for phase 'ready')."
         ),
     )
@@ -317,7 +309,6 @@ def _current_settings_payload(deps) -> dict:
         "model_name": cache.get("model_path") or serving_config["model_path"],
         "max_context_length": get_configured_context_limit(),
         "kv_quantization": bool(os.environ.get("KV_BITS")),
-        "auto_unload_time": auto_unload_seconds(),
     }
 
 
@@ -343,10 +334,7 @@ def _validate_settings(body: dict):
             raise _settings_error('"model_name" must be a non-empty string.')
         model_path = model_path.strip()
 
-    for key, env_name in (
-        ("max_context_length", "MAX_KV_SIZE"),
-        ("auto_unload_time", AUTO_UNLOAD_TIME_ENV),
-    ):
+    for key, env_name in (("max_context_length", "MAX_KV_SIZE"),):
         if key not in body:
             continue
         value = body[key]
@@ -455,9 +443,8 @@ def register_control_routes(app, deps) -> None:
     @app.post("/v1/apply_settings", include_in_schema=False)
     async def apply_settings_endpoint(request: Request):
         """Apply new serving settings. Accepts any subset of: model_name,
-        max_context_length, kv_quantization, auto_unload_time; plus
-        force=true to interrupt in-flight inference. auto_unload_time
-        applies live; the others restart model serving (not the HTTP
+        max_context_length, kv_quantization; plus force=true to interrupt
+        in-flight inference. Changes restart model serving (not the HTTP
         server) — poll GET /status until phase is "ready".
         """
         deps.require_management_api_key(request)
@@ -483,7 +470,7 @@ def register_control_routes(app, deps) -> None:
             )
 
         if not needs_restart:
-            # auto_unload_time only: applies live, nothing to restart.
+            # Live-applied settings: nothing to restart.
             try:
                 _apply_env(env_updates)
                 save_settings(config_updates)

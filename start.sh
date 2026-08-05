@@ -9,7 +9,7 @@ set -euo pipefail
 #   2) Junie descriptor -> written to ~/.junie/models
 #   3) python venv      -> created at ./.venv on first run
 #   4) server           -> mlx_vlm.server (port from server-config.json,
-#                          default 19239)
+#                          default 8085)
 #
 # Steps 1-3 are no-ops when already done, so this is also the everyday
 # start command.
@@ -35,7 +35,7 @@ export JUNIE_SERVER_CONFIG="$BASE_DIR/server-config.json"
 # first start creates it.
 PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
   "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
-PORT=${PORT:-19239}
+PORT=${PORT:-8085}
 
 LOG_FILE="$SCRIPT_DIR/mlx_server.log"
 

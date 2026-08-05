@@ -15,8 +15,6 @@ import os
 import tempfile
 from typing import Optional
 
-from .watchdog import AUTO_UNLOAD_TIME_ENV
-
 logger = logging.getLogger("mlx_vlm.server")
 
 CONFIG_PATH_ENV = "JUNIE_SERVER_CONFIG"
@@ -31,13 +29,12 @@ DEFAULT_CONFIG = {
     "draft_kind": "mtp",
     "max_context_length": None,
     "kv_quantization": False,
-    "auto_unload_time": None,
     # --- Launch settings (read once by `python -m mlx_vlm.server.junie`;
     # edit by hand while the server is stopped). ---
-    # Localhost only by default — the server has no auth unless --api-key
-    # is set; use "0.0.0.0" to expose it on the network.
-    "host": "127.0.0.1",
-    "port": 19239,
+    # Exposed on the network by default — set --api-key (or use
+    # "127.0.0.1") if the machine is reachable from untrusted hosts.
+    "host": "0.0.0.0",
+    "port": 8085,
     # W8A8 int8 prefill on the M5 neural accelerators (research/int8-nax).
     "int8_prefill": True,
     # Tokens per prefill chunk. Each chunk materializes per-layer attention
@@ -100,7 +97,6 @@ _VALIDATORS = {
     "draft_kind": lambda v: v is None or v in ("dflash", "eagle3", "mtp"),
     "max_context_length": _is_positive_int_or_none,
     "kv_quantization": lambda v: isinstance(v, bool),
-    "auto_unload_time": _is_positive_int_or_none,
     "host": lambda v: isinstance(v, str) and v.strip(),
     "port": _is_int_in(1, 65535),
     "int8_prefill": lambda v: isinstance(v, bool),
@@ -228,7 +224,16 @@ def apply_config_to_env(cfg: dict) -> None:
         else:
             os.environ[name] = str(value)
 
-    set_or_unset("MLX_VLM_PRELOAD_MODEL", cfg.get("model_name"))
+    model_name = cfg.get("model_name")
+    set_or_unset("MLX_VLM_PRELOAD_MODEL", model_name)
+    # Requests may address the served model by its bare name (without the
+    # HF org prefix, e.g. "Qwen3.6-27B-4bit"); alias it so they never
+    # trigger a load of a different model.
+    alias = model_name.rsplit("/", 1)[-1] if model_name else None
+    set_or_unset(
+        "MLX_VLM_MODEL_ALIASES",
+        f"{alias}={model_name}" if alias and alias != model_name else None,
+    )
     set_or_unset("MLX_VLM_DRAFT_MODEL", cfg.get("draft_model"))
     set_or_unset(
         "MLX_VLM_DRAFT_KIND",
@@ -238,7 +243,6 @@ def apply_config_to_env(cfg: dict) -> None:
     set_or_unset(
         "KV_BITS", DEFAULT_KV_QUANT_BITS if cfg.get("kv_quantization") else None
     )
-    set_or_unset(AUTO_UNLOAD_TIME_ENV, cfg.get("auto_unload_time"))
 
 
 def initialize_from_config() -> None:
@@ -253,12 +257,11 @@ def initialize_from_config() -> None:
         return
     logger.info(
         "Config: %s -> model=%s draft=%s max_context_length=%s "
-        "kv_quantization=%s auto_unload_time=%s",
+        "kv_quantization=%s",
         config_path(),
         cfg.get("model_name"),
         cfg.get("draft_model"),
         cfg.get("max_context_length"),
         cfg.get("kv_quantization"),
-        cfg.get("auto_unload_time"),
     )
     apply_config_to_env(cfg)

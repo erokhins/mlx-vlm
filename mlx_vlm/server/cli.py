@@ -20,7 +20,7 @@ from .generation import (
 )
 
 DEFAULT_SERVER_HOST = "0.0.0.0"
-DEFAULT_SERVER_PORT = 8080
+DEFAULT_SERVER_PORT = 8085
 
 logger = logging.getLogger("mlx_vlm.server")
 
@@ -37,7 +37,7 @@ def main():
         "--port",
         type=int,
         default=DEFAULT_SERVER_PORT,
-        help="Port for the HTTP server (default: 8080)",
+        help="Port for the HTTP server (default: 8085)",
     )
     parser.add_argument(
         "--trust-remote-code",
