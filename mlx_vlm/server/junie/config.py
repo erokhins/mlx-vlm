@@ -34,7 +34,9 @@ DEFAULT_CONFIG = {
     "auto_unload_time": None,
     # --- Launch settings (read once by `python -m mlx_vlm.server.junie`;
     # edit by hand while the server is stopped). ---
-    "host": "0.0.0.0",
+    # Localhost only by default — the server has no auth unless --api-key
+    # is set; use "0.0.0.0" to expose it on the network.
+    "host": "127.0.0.1",
     "port": 8085,
     # W8A8 int8 prefill on the M5 neural accelerators (research/int8-nax).
     "int8_prefill": True,
