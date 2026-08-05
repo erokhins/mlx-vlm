@@ -20,17 +20,11 @@ import os
 import signal
 import threading
 import time
-from threading import Lock, Thread, Timer
+from threading import Thread, Timer
 
 from fastapi import HTTPException, Request
 
-from ..generation import (
-    get_configured_context_limit,
-    get_kv_group_size,
-    get_kv_quant_scheme,
-    get_quantized_kv_start,
-    get_server_max_tokens,
-)
+from ..generation import get_configured_context_limit
 from ..runtime import runtime
 from .lifecycle import (
     PHASE_ERROR,
@@ -40,29 +34,28 @@ from .lifecycle import (
     PHASE_WARMING_UP,
     lifecycle,
 )
+from .state import metrics_in_flight, reload_lock, serving_config
+from .watchdog import (
+    AUTO_UNLOAD_TIME_ENV,
+    auto_unload_seconds,
+    ensure_idle_watchdog,
+)
 
 logger = logging.getLogger("mlx_vlm.server")
 
 DEFAULT_KV_QUANT_BITS = 8
 
 _ALLOWED_SETTINGS_KEYS = {
-    "model",
-    "context_size",
-    "kv_cache_quantization",
-    "kv_bits",
-    "kv_quant_scheme",
-    "kv_group_size",
-    "quantized_kv_start",
-    "max_tokens",
+    "model_name",
+    "max_context_length",
+    "kv_quantization",
+    "auto_unload_time",
     "force",
 }
 
-_reload_lock = Lock()
-
-# Model/adapter the server is configured to serve. Set by the startup loader
-# and updated by /apply_settings, so a model restart knows what to reload
-# even after MLX_VLM_PRELOAD_MODEL has been popped from the environment.
-_serving_config = {"model_path": None, "adapter_path": None}
+# Env updates that require a model-serving restart to take effect;
+# everything else (auto_unload_time) is applied live.
+_RESTART_ENV_KEYS = {"MAX_KV_SIZE", "KV_BITS"}
 
 
 # --------------------------------------------------------------------------
@@ -97,6 +90,7 @@ def start_background_model_load(deps) -> None:
         ).start()
     else:
         lifecycle.set_phase(PHASE_READY)
+    ensure_idle_watchdog(deps)
 
 
 def _load_configured_models(deps) -> None:
@@ -105,13 +99,14 @@ def _load_configured_models(deps) -> None:
         model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
         adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
         if model_path:
-            _serving_config["model_path"] = model_path
-            _serving_config["adapter_path"] = adapter_path
+            serving_config["model_path"] = model_path
+            serving_config["adapter_path"] = adapter_path
             lifecycle.set_phase(PHASE_LOADING_MODEL, f"loading {model_path}")
             logger.info("Pre-loading language model: %s", model_path)
             deps.get_cached_model(
                 model_path, adapter_path, model_kind="text_generation"
             )
+            serving_config["loaded_at"] = time.time()
             kv_bits = os.environ.get("KV_BITS")
             kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
             if kv_bits:
@@ -219,13 +214,6 @@ def _progress_snapshot(generator) -> list:
     return snapshot
 
 
-def _metrics_in_flight() -> int:
-    if runtime.metrics is None:
-        return 0
-    summary = runtime.metrics.snapshot()["summary"]
-    return int(summary.get("in_flight", 0) or 0)
-
-
 # --------------------------------------------------------------------------
 # Settings.
 # --------------------------------------------------------------------------
@@ -233,24 +221,11 @@ def _metrics_in_flight() -> int:
 
 def _current_settings_payload(deps) -> dict:
     cache = deps.model_cache_registry().for_kind("text_generation")
-    kv_bits_env = os.environ.get("KV_BITS")
-    kv_bits = float(kv_bits_env) if kv_bits_env else None
-    if kv_bits is not None and kv_bits == int(kv_bits):
-        kv_bits = int(kv_bits)
     return {
-        "port": int(
-            os.environ.get("MLX_VLM_SERVER_PORT", deps.default_server_port)
-        ),
-        "model": cache.get("model_path") or _serving_config["model_path"],
-        "adapter": cache.get("adapter_path") or _serving_config["adapter_path"],
-        "draft_model": os.environ.get("MLX_VLM_DRAFT_MODEL"),
-        "context_size": get_configured_context_limit(),
-        "kv_cache_quantization": kv_bits is not None,
-        "kv_bits": kv_bits,
-        "kv_quant_scheme": get_kv_quant_scheme(),
-        "kv_group_size": get_kv_group_size(),
-        "quantized_kv_start": get_quantized_kv_start(),
-        "max_tokens": get_server_max_tokens(),
+        "model_name": cache.get("model_path") or serving_config["model_path"],
+        "max_context_length": get_configured_context_limit(),
+        "kv_quantization": bool(os.environ.get("KV_BITS")),
+        "auto_unload_time": auto_unload_seconds(),
     }
 
 
@@ -270,62 +245,41 @@ def _validate_settings(body: dict):
     env_updates = {}
     model_path = None
 
-    if "model" in body:
-        model_path = body["model"]
+    if "model_name" in body:
+        model_path = body["model_name"]
         if not isinstance(model_path, str) or not model_path.strip():
-            raise _settings_error('"model" must be a non-empty string.')
+            raise _settings_error('"model_name" must be a non-empty string.')
         model_path = model_path.strip()
 
-    if "context_size" in body:
-        context_size = body["context_size"]
-        if context_size is None:
-            env_updates["MAX_KV_SIZE"] = None
-        elif isinstance(context_size, int) and context_size > 0:
-            env_updates["MAX_KV_SIZE"] = str(context_size)
-        else:
-            raise _settings_error('"context_size" must be a positive integer or null.')
-
-    kv_bits = body.get("kv_bits")
-    if kv_bits is not None and not (
-        isinstance(kv_bits, (int, float))
-        and not isinstance(kv_bits, bool)
-        and kv_bits > 0
-    ):
-        raise _settings_error('"kv_bits" must be a positive number or null.')
-    if "kv_cache_quantization" in body:
-        enabled = body["kv_cache_quantization"]
-        if not isinstance(enabled, bool):
-            raise _settings_error('"kv_cache_quantization" must be a boolean.')
-        if enabled:
-            env_updates["KV_BITS"] = str(kv_bits or DEFAULT_KV_QUANT_BITS)
-        else:
-            if kv_bits is not None:
-                raise _settings_error(
-                    '"kv_bits" conflicts with "kv_cache_quantization": false.'
-                )
-            env_updates["KV_BITS"] = None
-    elif "kv_bits" in body:
-        env_updates["KV_BITS"] = str(kv_bits) if kv_bits is not None else None
-
-    if "kv_quant_scheme" in body:
-        scheme = body["kv_quant_scheme"]
-        if scheme not in ("uniform", "turboquant"):
-            raise _settings_error('"kv_quant_scheme" must be "uniform" or "turboquant".')
-        env_updates["KV_QUANT_SCHEME"] = scheme
-
-    for key, env_name, minimum in (
-        ("kv_group_size", "KV_GROUP_SIZE", 1),
-        ("quantized_kv_start", "QUANTIZED_KV_START", 0),
-        ("max_tokens", "MLX_VLM_MAX_TOKENS", 1),
+    for key, env_name in (
+        ("max_context_length", "MAX_KV_SIZE"),
+        ("auto_unload_time", AUTO_UNLOAD_TIME_ENV),
     ):
         if key not in body:
             continue
         value = body[key]
-        if not isinstance(value, int) or isinstance(value, bool) or value < minimum:
-            raise _settings_error(f'"{key}" must be an integer >= {minimum}.')
-        env_updates[env_name] = str(value)
+        if value is None:
+            env_updates[env_name] = None
+        elif isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            env_updates[env_name] = str(value)
+        else:
+            raise _settings_error(f'"{key}" must be a positive integer or null.')
+
+    if "kv_quantization" in body:
+        enabled = body["kv_quantization"]
+        if not isinstance(enabled, bool):
+            raise _settings_error('"kv_quantization" must be a boolean.')
+        env_updates["KV_BITS"] = str(DEFAULT_KV_QUANT_BITS) if enabled else None
 
     return model_path, env_updates
+
+
+def _apply_env(env_updates: dict) -> None:
+    for key, value in env_updates.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
 
 
 def _apply_settings_worker(deps, model_path, adapter_path, env_updates) -> None:
@@ -333,25 +287,22 @@ def _apply_settings_worker(deps, model_path, adapter_path, env_updates) -> None:
     try:
         logger.info("Applying settings: %s (model=%s)", env_updates, model_path)
         deps.unload_model_sync()
-        for key, value in env_updates.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
+        _apply_env(env_updates)
         if model_path:
             lifecycle.set_phase(PHASE_LOADING_MODEL, f"loading {model_path}")
             deps.get_cached_model(
                 model_path, adapter_path, model_kind="text_generation"
             )
-            _serving_config["model_path"] = model_path
-            _serving_config["adapter_path"] = adapter_path
+            serving_config["model_path"] = model_path
+            serving_config["adapter_path"] = adapter_path
+            serving_config["loaded_at"] = time.time()
     except Exception as e:
         logger.exception("apply_settings reload failed")
         lifecycle.set_phase(PHASE_ERROR, f"apply_settings failed: {e}")
         return
     finally:
         lifecycle.set_loader_thread(None)
-        _reload_lock.release()
+        reload_lock.release()
     if model_path:
         _finish_model_startup(deps)
     else:
@@ -373,7 +324,7 @@ def register_control_routes(app, deps) -> None:
         snapshot = deps.server_runtime_snapshot()
         generator = runtime.response_generator
         progress = _progress_snapshot(generator) if generator is not None else []
-        in_flight = _metrics_in_flight()
+        in_flight = metrics_in_flight()
         return {
             "phase": phase["phase"],
             "phase_detail": phase["detail"],
@@ -383,7 +334,7 @@ def register_control_routes(app, deps) -> None:
             ),
             "model": {
                 "loaded": snapshot["loaded_model"] is not None,
-                "id": snapshot["loaded_model"] or _serving_config["model_path"],
+                "id": snapshot["loaded_model"] or serving_config["model_path"],
                 "draft_model": os.environ.get("MLX_VLM_DRAFT_MODEL"),
                 "context_limit": snapshot["effective_context_limit"],
             },
@@ -405,11 +356,11 @@ def register_control_routes(app, deps) -> None:
     @app.post("/apply_settings")
     @app.post("/v1/apply_settings", include_in_schema=False)
     async def apply_settings_endpoint(request: Request):
-        """Apply new serving settings by restarting model serving (not the
-        HTTP server). Accepts any subset of: model, context_size,
-        kv_cache_quantization, kv_bits, kv_quant_scheme, kv_group_size,
-        quantized_kv_start, max_tokens; plus force=true to interrupt
-        in-flight inference. Poll GET /status until phase is "ready".
+        """Apply new serving settings. Accepts any subset of: model_name,
+        max_context_length, kv_quantization, auto_unload_time; plus
+        force=true to interrupt in-flight inference. auto_unload_time
+        applies live; the others restart model serving (not the HTTP
+        server) — poll GET /status until phase is "ready".
         """
         deps.require_management_api_key(request)
         try:
@@ -422,12 +373,28 @@ def register_control_routes(app, deps) -> None:
         if requested_model is None and not env_updates:
             raise _settings_error("No settings provided.")
         force = bool(body.get("force"))
+        needs_restart = requested_model is not None or any(
+            key in _RESTART_ENV_KEYS for key in env_updates
+        )
 
-        if not _reload_lock.acquire(blocking=False):
+        if not reload_lock.acquire(blocking=False):
             raise HTTPException(
                 status_code=409,
                 detail="Another settings change is already in progress.",
             )
+
+        if not needs_restart:
+            # auto_unload_time only: applies live, nothing to restart.
+            try:
+                _apply_env(env_updates)
+            finally:
+                reload_lock.release()
+            return {
+                "status": "applied",
+                "changes": sorted(set(body) - {"force"}),
+                "settings": _current_settings_payload(deps),
+            }
+
         try:
             phase = lifecycle.phase()
             if phase in (PHASE_LOADING_MODEL, PHASE_RESTARTING):
@@ -435,7 +402,7 @@ def register_control_routes(app, deps) -> None:
                     status_code=409,
                     detail=f"Server is busy (phase '{phase}'); retry once it settles.",
                 )
-            in_flight = _metrics_in_flight()
+            in_flight = metrics_in_flight()
             if in_flight > 0 and not force:
                 raise HTTPException(
                     status_code=409,
@@ -450,10 +417,10 @@ def register_control_routes(app, deps) -> None:
                 adapter_path = None
             else:
                 target_model = (
-                    cache.get("model_path") or _serving_config["model_path"]
+                    cache.get("model_path") or serving_config["model_path"]
                 )
                 adapter_path = (
-                    cache.get("adapter_path") or _serving_config["adapter_path"]
+                    cache.get("adapter_path") or serving_config["adapter_path"]
                 )
             lifecycle.set_phase(PHASE_RESTARTING, "applying new settings")
             Thread(
@@ -463,7 +430,7 @@ def register_control_routes(app, deps) -> None:
                 name="apply-settings",
             ).start()
         except Exception:
-            _reload_lock.release()
+            reload_lock.release()
             raise
         return {
             "status": "applying",

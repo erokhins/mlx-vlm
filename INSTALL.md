@@ -102,7 +102,7 @@ Full request/response examples for every endpoint: [JUNIE_API.md](JUNIE_API.md).
 | `http://localhost:8085/health` | liveness check |
 | `http://localhost:8085/status` | lifecycle phase (`loading_model` / `warming_up` / `ready` / `restarting` / `error`) plus live inference progress: per-request stage, prefill %, generated tokens |
 | `http://localhost:8085/current_settings` | the settings model serving currently runs with (port, model, context size, KV cache quantization, ...) |
-| `http://localhost:8085/apply_settings` | POST a JSON subset of `{model, context_size, kv_cache_quantization, kv_bits, kv_quant_scheme, kv_group_size, quantized_kv_start, max_tokens, force}` — restarts model serving (not the HTTP server) with the new settings; poll `/status` until `ready` |
+| `http://localhost:8085/apply_settings` | POST a JSON subset of `{model_name, max_context_length, kv_quantization, auto_unload_time, force}` — restarts model serving (not the HTTP server) with the new settings (`auto_unload_time` applies live); poll `/status` until `ready` |
 | `http://localhost:8085/shutdown` | POST — graceful shutdown of the whole server process |
 | `http://localhost:8085/v1/cache/stats` | APC stats: sessions, checkpoints, the pinned seed, hit counters |
 

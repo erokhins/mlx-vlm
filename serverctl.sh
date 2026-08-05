@@ -8,13 +8,15 @@ set -euo pipefail
 #   ./serverctl.sh status                   lifecycle phase + inference progress
 #   ./serverctl.sh wait                     poll status until phase is "ready"
 #   ./serverctl.sh settings                 current serving settings
-#   ./serverctl.sh apply key=value [...]    apply settings and restart model serving:
-#                                             ./serverctl.sh apply context_size=150000
-#                                             ./serverctl.sh apply kv_cache_quantization=true kv_bits=8
-#                                             ./serverctl.sh apply context_size=null force=true
+#   ./serverctl.sh apply key=value [...]    apply settings (restarts model serving,
+#                                           except auto_unload_time which applies live):
+#                                             ./serverctl.sh apply max_context_length=150000
+#                                             ./serverctl.sh apply kv_quantization=true
+#                                             ./serverctl.sh apply auto_unload_time=600
+#                                             ./serverctl.sh apply max_context_length=null force=true
 #                                           numbers/true/false/null are sent as-is,
 #                                           anything else as a JSON string
-#   ./serverctl.sh apply-json '{"context_size": 150000}'
+#   ./serverctl.sh apply-json '{"max_context_length": 150000}'
 #   ./serverctl.sh stop                     POST /shutdown (graceful)
 #   ./serverctl.sh health | models | metrics | cache-stats | cache-reset | unload
 #

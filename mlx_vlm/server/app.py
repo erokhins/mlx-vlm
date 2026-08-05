@@ -822,7 +822,6 @@ _junie_deps = SimpleNamespace(
     get_cached_model=lambda *args, **kwargs: get_cached_model(*args, **kwargs),
     unload_model_sync=lambda: unload_model_sync(),
     start_seed_prefix_warmup=lambda **kwargs: _start_seed_prefix_warmup(**kwargs),
-    default_server_port=DEFAULT_SERVER_PORT,
 )
 register_control_routes(app, _junie_deps)
 

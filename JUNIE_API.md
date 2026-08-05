@@ -13,7 +13,7 @@ is needed.
 
 `./serverctl.sh` in the repo root is a thin curl wrapper over these
 endpoints (`./serverctl.sh status`, `settings`,
-`apply context_size=150000`, `wait`, `stop`, ...).
+`apply max_context_length=150000`, `wait`, `stop`, ...).
 
 Inference itself goes through **`POST /v1/chat/completions`** — standard
 OpenAI chat-completions API (not documented here). Its only local quirks:
@@ -124,71 +124,77 @@ The settings model serving is currently running with.
 
 ```json
 {
-  "port": 8085,
-  "model": "mlx-community/Qwen3.6-27B-4bit",
-  "adapter": null,
-  "draft_model": "mlx-community/Qwen3.6-27B-MTP-4bit",
-  "context_size": null,
-  "kv_cache_quantization": false,
-  "kv_bits": null,
-  "kv_quant_scheme": "uniform",
-  "kv_group_size": 64,
-  "quantized_kv_start": 5000,
-  "max_tokens": 2048
+  "model_name": "mlx-community/Qwen3.6-27B-4bit",
+  "max_context_length": null,
+  "kv_quantization": false,
+  "auto_unload_time": null
 }
 ```
 
-- `context_size` — server-side prompt+generation token cap
+- `max_context_length` — server-side prompt+generation token cap
   (`null` = unlimited, the model's native context applies).
-- `kv_cache_quantization` / `kv_bits` — whether the KV cache is quantized
-  and at how many bits (`kv_bits` may be fractional, e.g. `3.5` with the
-  `turboquant` scheme).
-- `max_tokens` — default generation cap for requests that don't set one.
+- `kv_quantization` — whether the KV cache is quantized (8-bit).
+- `auto_unload_time` — seconds of inference inactivity after which the
+  model is unloaded from memory (`null` = never). After an auto-unload
+  the server stays `ready` and `/status` shows `model.loaded: false`;
+  the next inference request reloads the model (that request is slow).
 
 ### `POST /apply_settings`
 
-Apply new serving settings. The HTTP server keeps running; model serving
-restarts in the background (unload → apply → reload → seed re-warmup).
-**Poll `GET /status` until `phase` is `"ready"`** — the reload of the 27B
-model takes on the order of a minute.
+Apply new serving settings. The HTTP server keeps running. Changing
+`model_name`, `max_context_length` or `kv_quantization` restarts model
+serving in the background (unload → apply → reload → seed re-warmup) —
+**poll `GET /status` until `phase` is `"ready"`**; the reload of the 27B
+model takes on the order of a minute. `auto_unload_time` alone applies
+live, without a restart.
 
 Request — any subset of:
 
 | Field | Type | Effect |
 |---|---|---|
-| `context_size` | int > 0 or `null` | token cap for prompt + generation; `null` removes the cap |
-| `kv_cache_quantization` | bool | turn KV cache quantization on (default 8-bit) or off |
-| `kv_bits` | number > 0 or `null` | quantization bits; combine with `kv_cache_quantization: true` or use alone |
-| `kv_quant_scheme` | `"uniform"` \| `"turboquant"` | quantization backend |
-| `kv_group_size` | int ≥ 1 | group size for uniform quantization |
-| `quantized_kv_start` | int ≥ 0 | first token index to quantize from |
-| `max_tokens` | int ≥ 1 | default generation cap |
-| `model` | string | switch to a different model (HF repo id or local path) |
+| `model_name` | string | switch to a different model (HF repo id or local path) |
+| `max_context_length` | int > 0 or `null` | token cap for prompt + generation; `null` removes the cap |
+| `kv_quantization` | bool | turn 8-bit KV cache quantization on or off |
+| `auto_unload_time` | int > 0 or `null` | idle seconds before the model is unloaded from memory; `null` disables |
 | `force` | bool | proceed even when inference is in flight (aborts it) |
 
 ```json
 {
-  "context_size": 150000,
-  "kv_cache_quantization": true,
-  "kv_bits": 8
+  "max_context_length": 150000,
+  "kv_quantization": true
 }
 ```
 
-Response (`200`) — the restart has been *started*:
+Response (`200`) when a restart was started:
 
 ```json
 {
   "status": "applying",
   "model": "mlx-community/Qwen3.6-27B-4bit",
-  "changes": ["context_size", "kv_bits", "kv_cache_quantization"],
+  "changes": ["kv_quantization", "max_context_length"],
   "message": "Model serving is restarting; poll GET /status until phase is 'ready'."
+}
+```
+
+Response (`200`) for a live change (`auto_unload_time` only):
+
+```json
+{
+  "status": "applied",
+  "changes": ["auto_unload_time"],
+  "settings": {
+    "model_name": "mlx-community/Qwen3.6-27B-4bit",
+    "max_context_length": 150000,
+    "kv_quantization": true,
+    "auto_unload_time": 600
+  }
 }
 ```
 
 Errors:
 
 - `400` — validation, e.g.
-  `{"detail": "\"context_size\" must be a positive integer or null."}` or
+  `{"detail": "\"max_context_length\" must be a positive integer or null."}` or
   `{"detail": "Unknown settings: ['bogus']"}`
 - `409` — a settings change is already in progress, the server is still
   loading, or inference is in flight and `force` was not set:
