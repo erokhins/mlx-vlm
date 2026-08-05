@@ -65,6 +65,9 @@ class ServerRuntime:
     audio_queue: Optional[Any] = None
     apc_manager: Optional[Any] = None
     metrics: Optional[Any] = None
+    # Hook invoked (from the generation thread) when corrupted generation
+    # is detected; the control plane uses it to restart model serving.
+    on_generation_corrupted: Optional[Any] = None
 
 
 runtime = ServerRuntime()

@@ -79,6 +79,12 @@ def start_background_model_load(deps) -> None:
     # The persisted config (JUNIE_SERVER_CONFIG), not command-line flags,
     # decides the model and serving settings when present.
     initialize_from_config()
+    # Corrupted-generation bandage: when the engine detects a token-id-0
+    # loop it fails the request (client gets 503) and calls this to
+    # restart model serving with a fresh model + caches.
+    runtime.on_generation_corrupted = (
+        lambda reason: _restart_after_corruption(deps, reason)
+    )
     has_preload = any(
         os.environ.get(name)
         for name in (
@@ -163,6 +169,34 @@ def _load_configured_models(deps) -> None:
     finally:
         lifecycle.set_loader_thread(None)
     _finish_model_startup(deps)
+
+
+def _restart_after_corruption(deps, reason: str) -> None:
+    """Restart model serving after a corrupted-generation detection.
+
+    Called from the generation thread — must not block: it only spawns the
+    reload worker (which stops the generator, unloads and reloads the
+    model; requests get 503 while the phase is "restarting").
+    """
+    if not reload_lock.acquire(blocking=False):
+        logger.warning(
+            "Corruption restart skipped: another reload is already running."
+        )
+        return
+    logger.error("Restarting model serving after corrupted generation: %s", reason)
+    lifecycle.set_phase(PHASE_RESTARTING, "restarting after corrupted generation")
+    Thread(
+        target=_apply_settings_worker,
+        args=(
+            deps,
+            serving_config["model_path"],
+            serving_config["adapter_path"],
+            {},
+            {},
+        ),
+        daemon=True,
+        name="corruption-restart",
+    ).start()
 
 
 def _finish_model_startup(deps) -> None:

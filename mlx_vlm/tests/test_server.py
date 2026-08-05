@@ -651,6 +651,87 @@ def _unstarted_response_generator():
     return gen
 
 
+def test_zero_token_run_fails_request_and_triggers_restart(monkeypatch):
+    """A run of token id 0 fails the request with CorruptedGenerationError
+    and invokes the corruption-restart hook."""
+    monkeypatch.setenv("MLX_VLM_MAX_ZERO_TOKEN_RUN", "3")
+
+    class FakeDetokenizer:
+        def __init__(self):
+            self.last_segment = "!"
+
+        def add_token(self, token):
+            self.last_segment = "!"
+
+        def finalize(self):
+            pass
+
+    class FakeBatchGenerator:
+        def __init__(self):
+            self.unprocessed_prompts = []
+            self.has_pending_prompts = False
+            self.removed = []
+
+        def next(self, **kwargs):
+            return [], [
+                SimpleNamespace(
+                    uid=1,
+                    token=0,
+                    token_logprob=0.0,
+                    finish_reason=None,
+                )
+            ]
+
+        def remove(self, uid):
+            self.removed.append(uid)
+
+    gen = _unstarted_response_generator()
+    rqueue = Queue()
+    active = {
+        1: {
+            "rqueue": rqueue,
+            "streamer": server_generation._ServerTokenStreamer(
+                SimpleNamespace(), FakeDetokenizer()
+            ),
+            "request_id": "corrupt-test",
+            "queued_at": 0.0,
+            "prompt_tokens": 4,
+            "prefill_started_at": 0.0,
+            "prefill_processed": 4,
+            "generated_tokens": 0,
+            "decode_started_at": None,
+            "last_token_at": None,
+        }
+    }
+    gen._active_requests = active
+
+    restarts = []
+    monkeypatch.setattr(
+        server.runtime,
+        "on_generation_corrupted",
+        lambda reason: restarts.append(reason),
+    )
+
+    batch_gen = FakeBatchGenerator()
+    for _ in range(3):
+        gen._step(batch_gen, active)
+
+    # Two zero-tokens streamed, the third crosses the threshold.
+    items = []
+    while not rqueue.empty():
+        items.append(rqueue.get_nowait())
+    errors = [
+        i
+        for i in items
+        if isinstance(i, server_generation.CorruptedGenerationError)
+    ]
+    assert errors, f"expected CorruptedGenerationError in {items!r}"
+    assert items[-1] is None  # stream terminated
+    assert batch_gen.removed == [1]
+    assert 1 not in active
+    assert restarts and "corrupt-test" in restarts[0]
+
+
 def test_collect_pending_requests_respects_max_items():
     """max_items caps admission; the rest stay queued (serial mode)."""
     gen = _unstarted_response_generator()

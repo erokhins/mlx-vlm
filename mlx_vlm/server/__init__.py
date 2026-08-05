@@ -59,6 +59,7 @@ from .generation import (
     METRICS_HISTORY_LIMIT,
     METRICS_RECENT_LIMIT,
     BatchGenerator,
+    CorruptedGenerationError,
     GenerationArguments,
     GenerationContext,
     PromptTooLongError,

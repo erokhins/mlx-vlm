@@ -57,6 +57,12 @@ METRICS_HISTORY_LIMIT = 100
 METRICS_RECENT_LIMIT = 32
 
 
+class CorruptedGenerationError(RuntimeError):
+    """The model emitted a long run of token id 0 ("!") — the signature of
+    corrupted serving state (zeroed/NaN logits argmax to id 0). The request
+    is failed and the control plane restarts model serving."""
+
+
 class PromptTooLongError(ValueError):
     """Raised when a request exceeds the configured server context budget."""
 
@@ -358,6 +364,15 @@ def get_max_kv_size(model: str):
         logger.warning("Model %s uses QuantizedKVCache; MAX_KV_SIZE is ignored.", model)
         return None
     return max_kv_tokens
+
+
+def get_max_zero_token_run() -> int:
+    """Consecutive token-id-0 generations tolerated before the request is
+    failed as corrupted (0 disables the check)."""
+    try:
+        return max(0, int(os.environ.get("MLX_VLM_MAX_ZERO_TOKEN_RUN", "8")))
+    except ValueError:
+        return 8
 
 
 def get_max_concurrent_requests() -> int:
@@ -2450,6 +2465,44 @@ class ResponseGenerator:
                 text = self._stream_text(info, tok, r.finish_reason)
 
             lp = r.token_logprob
+
+            # Corrupted-state bandage: a healthy model never emits a long
+            # run of token id 0 ("!"); that is the argmax of zeroed/NaN
+            # logits. Fail the request (clients get 503 and retry) and ask
+            # the control plane to restart model serving.
+            zero_limit = get_max_zero_token_run()
+            if zero_limit and token_count and r.finish_reason is None:
+                if int(tok) == 0:
+                    info["zero_token_run"] = info.get("zero_token_run", 0) + 1
+                else:
+                    info["zero_token_run"] = 0
+                if info["zero_token_run"] >= zero_limit:
+                    reason = (
+                        f"request {info.get('request_id', r.uid)} emitted "
+                        f"{info['zero_token_run']} consecutive token id 0 "
+                        f"(generated_tokens="
+                        f"{int(info.get('generated_tokens', 0) or 0)})"
+                    )
+                    logger.error(
+                        "Corrupted generation detected: %s; failing the "
+                        "request and requesting a model-serving restart.",
+                        reason,
+                    )
+                    rqueue.put(CorruptedGenerationError(reason))
+                    rqueue.put(None)
+                    batch_gen.remove(r.uid)
+                    del active[r.uid]
+                    from .runtime import runtime as _runtime
+
+                    callback = getattr(_runtime, "on_generation_corrupted", None)
+                    if callable(callback):
+                        try:
+                            callback(reason)
+                        except Exception:
+                            logger.exception(
+                                "Corruption-restart callback failed"
+                            )
+                    continue
 
             if self._raw_token_log and token_count:
                 info.setdefault("raw_tokens", []).append(int(tok))

@@ -26,6 +26,7 @@ from ..prompt_utils import apply_chat_template, extract_text_from_content
 from ..tool_parsers import _infer_tool_parser_from_processor, load_tool_module
 from ..utils import prepare_inputs
 from .generation import (
+    CorruptedGenerationError,
     GenerationMetrics,
     PromptTooLongError,
     _build_metrics_envelope,
@@ -2357,6 +2358,23 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=400, detail=str(e))
+            except CorruptedGenerationError as e:
+                runtime.metrics.record_failure(
+                    endpoint="/chat/completions",
+                    model=request.model,
+                    stream=False,
+                    error=f"corrupted_generation: {e}",
+                )
+                mx.clear_cache()
+                gc.collect()
+                # 503: model serving is being restarted; clients retry.
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Generation produced corrupted output; model serving "
+                        "is restarting. Retry shortly."
+                    ),
+                )
             except Exception as e:
                 runtime.metrics.record_failure(
                     endpoint="/chat/completions",
