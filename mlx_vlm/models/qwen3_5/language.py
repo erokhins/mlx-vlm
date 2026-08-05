@@ -1550,9 +1550,20 @@ class Qwen3_5Attention(nn.Module):
         else:
             output = None
 
-        if output is None and target_verify and L > 1:
-            # A quantized KV cache returns (packed, scales, biases) tuples
-            # from update_and_fetch; the seq axis is -2 in every part.
+        if output is None and target_verify and L > 1 and not isinstance(mask, mx.array):
+            # Verify block: the L suffix queries attend causally over the full
+            # context. One SDPA call with a causal mask — equivalent to the
+            # per-position slicing loop below, but 1 kernel instead of L, and
+            # for quantized caches it avoids GBs of accumulated per-slice
+            # temporaries during MTP decode.
+            output = scaled_dot_product_attention(
+                queries, keys, values, cache=cache, scale=self.scale, mask="causal"
+            )
+        elif output is None and target_verify and L > 1:
+            # Explicit array masks carry padding info a causal mask can't
+            # express: keep the per-position loop. A quantized KV cache
+            # returns (packed, scales, biases) tuples from update_and_fetch;
+            # the seq axis is -2 in every part.
             def _kv_slice(kv, end):
                 if isinstance(kv, tuple):
                     return tuple(part[:, :, :end, :] for part in kv)

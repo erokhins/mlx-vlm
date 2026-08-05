@@ -293,6 +293,14 @@ fi
 export APC_ENABLED=1
 export APC_EXACT_SESSIONS=2        # concurrent conversations kept warm
 export APC_SESSION_CHECKPOINTS=8   # resumable positions per conversation
+
+# Cap the n-gram prompt-lookup draft window (default doubles to 32 on full
+# accepts). Every drafted block is verified in one forward whose per-layer
+# GDN intermediate states scale with the block length — at window 32 that
+# transiently pins ~11 GB during decode on 30k contexts. Window 8 keeps the
+# n-gram speedup (measured: same wall time as 32 on the junie replay) at
+# ~1 GB instead.
+export MLX_VLM_NGRAM_MAX=8
 # Persist the pinned seed snapshot on SSD so it survives restarts (only the
 # seed is written -- APC_DISK_EXACT_SCOPE defaults to "pinned", so the disk
 # tier stays at ~1 GB instead of one multi-GB snapshot per request).
@@ -309,18 +317,21 @@ SEED_REQUEST="$SCRIPT_DIR/research/junie.json"
 # W8A8 int8 prefill on the M5 neural accelerators (see
 # research/int8-nax/README.md). int8 weight tensors are built per layer by a
 # fused kernel and freed right after use (MLX_VLM_INT8_CACHE=none default),
-# so peak memory overhead is ~one layer, not a 24 GB copy; the larger
-# prefill step amortizes the per-chunk rebuild (4096 measured best:
-# ~1000 tok/s at 24.8 GB peak on a 12.6k prompt). If a quality issue shows
-# up on real workloads, first try MLX_VLM_INT8_SCOPE=mlp (keeps attention
-# numerics untouched), then drop --int8-prefill entirely.
+# so peak memory overhead is ~one layer, not a 24 GB copy.
+# Prefill step 1024: each prefill chunk materializes per-layer attention
+# scores of step x context, so the step directly scales peak memory on long
+# contexts (sweep on 31.7k prompts: 4096 -> 36.9 GB peak @980 tok/s,
+# 1024 -> 28.6 GB @910 tok/s; warm-workload speed is identical). If a
+# quality issue shows up on real workloads, first try
+# MLX_VLM_INT8_SCOPE=mlp (keeps attention numerics untouched), then drop
+# --int8-prefill entirely.
 # The model and drafter are NOT passed here — the server picks them up
 # from the config file (JUNIE_SERVER_CONFIG above).
 exec "$PYTHON_BIN" -m mlx_vlm.server \
   --host 0.0.0.0 \
   --port "$PORT" \
   --int8-prefill \
-  --prefill-step-size 4096 \
+  --prefill-step-size 1024 \
   --preserve-thinking \
   --seed-request "$SEED_REQUEST" \
   --log-raw-tokens
