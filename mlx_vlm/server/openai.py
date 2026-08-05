@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from ..generate import generate, stream_generate
@@ -2104,6 +2104,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                 ] = []
 
                 if runtime.response_generator is not None:
+                    # Populated with the token stream once the request is
+                    # admitted to the batch, so the disconnect watcher below
+                    # can cancel the generation (stream.close() -> cancel).
+                    stream_holder: List[Any] = []
 
                     def _blocking_generate():
                         metrics = GenerationMetrics()
@@ -2120,6 +2124,7 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             args=gen_args,
                             **({"videos": videos} if videos else {}),
                         )
+                        stream_holder.append(token_iter)
                         pt = ctx.prompt_tokens
                         for token in token_iter:
                             text += token.text
@@ -2138,6 +2143,32 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                             pass
                         return pt, text, gt, fr, metrics, logprobs
 
+                    # Unlike the streaming path, a non-streaming client that
+                    # disconnects would otherwise never be noticed and the
+                    # generation would run to completion for nobody.
+                    gen_thread = asyncio.create_task(
+                        asyncio.to_thread(_blocking_generate)
+                    )
+                    client_gone = False
+                    while True:
+                        done, _ = await asyncio.wait({gen_thread}, timeout=0.5)
+                        if done:
+                            break
+                        if not client_gone and await http_request.is_disconnected():
+                            client_gone = True
+                            logger.info(
+                                "Client disconnected; cancelling non-streaming "
+                                "generation."
+                            )
+                        if client_gone:
+                            # close() is idempotent; retried each tick in case
+                            # the request had not been admitted to the batch
+                            # when the disconnect was first seen.
+                            for token_stream in stream_holder:
+                                try:
+                                    token_stream.close()
+                                except Exception:
+                                    pass
                     (
                         prompt_tokens,
                         full_text,
@@ -2145,7 +2176,18 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         finish_reason,
                         metrics,
                         collected_logprobs,
-                    ) = await asyncio.to_thread(_blocking_generate)
+                    ) = gen_thread.result()
+                    if client_gone:
+                        runtime.metrics.record_failure(
+                            endpoint="/chat/completions",
+                            model=request.model,
+                            stream=False,
+                            error="client_disconnected",
+                        )
+                        mx.clear_cache()
+                        gc.collect()
+                        # 499: client closed request; nobody reads this.
+                        return Response(status_code=499)
                 else:
                     gen_result = generate(
                         model=model,

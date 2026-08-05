@@ -14,6 +14,7 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.datastructures import MutableHeaders
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
 
@@ -894,11 +895,33 @@ app.include_router(inference_router)
 # MLX_VLM API endpoints
 
 
-@app.middleware("http")
-async def add_server_header(request: Request, call_next):
-    response = await call_next(request)
-    response.headers["Server"] = f"mlx_vlm/{__version__}"
-    return response
+class _ServerHeaderMiddleware:
+    """Add the Server header as pure ASGI middleware.
+
+    Deliberately not ``@app.middleware("http")`` (BaseHTTPMiddleware): that
+    wrapper proxies the receive channel and never forwards
+    ``http.disconnect``, so endpoints could not detect client disconnects
+    (Request.is_disconnected() stayed False forever and in-flight
+    generation for vanished clients ran to completion).
+    """
+
+    def __init__(self, asgi_app):
+        self.asgi_app = asgi_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.asgi_app(scope, receive, send)
+            return
+
+        async def send_with_server_header(message):
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Server"] = f"mlx_vlm/{__version__}"
+            await send(message)
+
+        await self.asgi_app(scope, receive, send_with_server_header)
+
+
+app.add_middleware(_ServerHeaderMiddleware)
 
 
 @app.get("/health")
