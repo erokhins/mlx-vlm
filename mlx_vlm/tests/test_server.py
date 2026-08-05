@@ -639,7 +639,10 @@ def _unstarted_response_generator():
     gen.top_logprobs_k = 0
     gen.apc_manager = None
     gen.tokenizer = None
+    gen._raw_token_log = False
+    gen._tokenizer_lock = Lock()
     gen.requests = Queue()
+    gen._active_requests = {}
     gen._stop = False
     gen._ready = Event()
     gen._load_error = None
@@ -5896,6 +5899,14 @@ class TestResponseGenerator:
                 pass
 
         asyncio.run(run_lifespan())
+
+        # Preloading now happens on a background thread (server/junie);
+        # wait for it before asserting.
+        import threading
+
+        for thread in list(threading.enumerate()):
+            if thread.name == "model-preload":
+                thread.join(timeout=5)
 
         assert calls == [
             ("language-demo", "adapter-demo", "text_generation"),

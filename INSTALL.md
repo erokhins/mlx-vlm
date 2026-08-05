@@ -18,9 +18,14 @@ cd mlx-vlm
 ./start.sh
 ```
 
-Output goes to the screen **and** to `mlx_server.log` in the repo dir
+The script returns immediately: it launches everything in the background
+and prints nothing. All output goes to `mlx_server.log` in the repo dir
 (gitignored, truncated on each start) — so after a problem you can always
-inspect or share the log of the last run.
+inspect or share the log of the last run. Watch startup progress with:
+
+```bash
+curl -s http://localhost:8085/status   # phase: loading_model -> warming_up -> ready
+```
 
 The first run takes a while; it automatically:
 
@@ -35,8 +40,15 @@ The first run takes a while; it automatically:
    `Seed prefix warmed and pinned` in the log).
 
 Every later run skips 1–3 automatically (the descriptor/default are just
-rewritten), so `./start.sh` is also the everyday start command. Stop with
-Ctrl-C.
+rewritten), so `./start.sh` is also the everyday start command; it's a
+no-op when the server is already up. Stop with:
+
+```bash
+curl -s -X POST http://localhost:8085/shutdown
+```
+
+(`./start.sh --foreground` runs it in the current shell instead —
+output still goes to the log; stop with Ctrl-C.)
 
 Then restart Junie — it will use the local model by default. (If
 `~/.junie/settings.json` didn't exist yet, start Junie once and re-run
@@ -80,10 +92,16 @@ are fully KV-cached.)
 
 ## Server endpoints
 
+Full request/response examples for every endpoint: [JUNIE_API.md](JUNIE_API.md).
+
 | URL | What |
 |---|---|
 | `http://localhost:8085/v1/chat/completions` | OpenAI-compatible chat endpoint (this is what Junie calls); responses include a `timings` block with prefill/decode speeds and speculative-acceptance counters |
 | `http://localhost:8085/health` | liveness check |
+| `http://localhost:8085/status` | lifecycle phase (`loading_model` / `warming_up` / `ready` / `restarting` / `error`) plus live inference progress: per-request stage, prefill %, generated tokens |
+| `http://localhost:8085/current_settings` | the settings model serving currently runs with (port, model, context size, KV cache quantization, ...) |
+| `http://localhost:8085/apply_settings` | POST a JSON subset of `{model, context_size, kv_cache_quantization, kv_bits, kv_quant_scheme, kv_group_size, quantized_kv_start, max_tokens, force}` — restarts model serving (not the HTTP server) with the new settings; poll `/status` until `ready` |
+| `http://localhost:8085/shutdown` | POST — graceful shutdown of the whole server process |
 | `http://localhost:8085/v1/cache/stats` | APC stats: sessions, checkpoints, the pinned seed, hit counters |
 
 ## What to expect in the log

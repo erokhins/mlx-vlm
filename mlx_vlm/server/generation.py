@@ -1093,6 +1093,9 @@ class ResponseGenerator:
         self._raw_token_log = get_log_raw_tokens_enabled()
         self.tokenizer = None
         self.requests: Queue = Queue()
+        # uid -> progress info dict, owned by the generation thread; the
+        # control plane (server/junie) only takes read-only snapshots.
+        self._active_requests: dict = {}
         self._stop = False
         self._ready = Event()
         self._load_error: Optional[Exception] = None
@@ -1299,6 +1302,7 @@ class ResponseGenerator:
         return {
             "request_id": request_id,
             "queued_at": request.queued_at,
+            "prompt_tokens": int(request.prompt_tokens or 0),
             "prefill_started_at": now,
             "prefill_processed": -1,
             "generated_tokens": 0,
@@ -1796,8 +1800,10 @@ class ResponseGenerator:
         generation_stream = mx.default_stream(mx.default_device())
 
         batch_gen = None
-        # uid -> {rqueue, tokens, gen_kwargs}
-        active: dict = {}
+        # uid -> {rqueue, tokens, gen_kwargs}; shared with the control-plane
+        # progress snapshot (mutated only here, on the generation thread).
+        # getattr: tests build generators via __new__ without running __init__.
+        active: dict = getattr(self, "_active_requests", {})
 
         while not self._stop:
             try:
@@ -1938,6 +1944,7 @@ class ResponseGenerator:
                 mx.clear_cache()
                 gc.collect()
 
+        active.clear()
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
 

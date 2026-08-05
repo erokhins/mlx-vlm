@@ -40,6 +40,8 @@ from .generation import (
     get_quantized_kv_start,
     get_top_logprobs_k,
 )
+from .junie import register_control_routes, start_background_model_load
+from .junie.lifecycle import lifecycle
 from .openai import register_routes as register_openai_routes
 from .responses_state import _split_thinking as _split_thinking_text
 from .runtime import ModelCacheRegistry, runtime
@@ -327,7 +329,7 @@ def load_audio_model(model_path: str):
     return load_model(model_path)
 
 
-def _start_seed_prefix_warmup() -> None:
+def _start_seed_prefix_warmup(on_done=None) -> bool:
     """Prefill and pin a stable cross-session prompt prefix at startup.
 
     ``MLX_VLM_SEED_REQUEST`` points at a chat-completions request body whose
@@ -340,17 +342,20 @@ def _start_seed_prefix_warmup() -> None:
     trailing generation header), and the pin keeps it from ever being
     LRU-evicted. With ``APC_DISK_PATH`` set the snapshot also persists, so
     later restarts warm from disk instead of re-prefilling.
+
+    Returns True when a warmup thread was started; ``on_done`` (optional)
+    fires when that thread finishes, successfully or not.
     """
     seed_path = os.environ.get("MLX_VLM_SEED_REQUEST")
     if not seed_path:
-        return
+        return False
 
     port = os.environ.get("MLX_VLM_SERVER_PORT")
     if not port:
         logger.warning("Seed request set but server port unknown; skipping.")
-        return
+        return False
 
-    def run():
+    def warmup():
         import urllib.error
         import urllib.request
 
@@ -402,7 +407,15 @@ def _start_seed_prefix_warmup() -> None:
         except Exception as e:
             logger.warning("Seed prefix warmup failed: %s", e)
 
+    def run():
+        try:
+            warmup()
+        finally:
+            if on_done is not None:
+                on_done()
+
     Thread(target=run, daemon=True, name="apc-seed-warmup").start()
+    return True
 
 
 @asynccontextmanager
@@ -421,48 +434,10 @@ async def lifespan(app):
         _apply_int8_prefill()
         logger.info("int8 NAX prefill patch applied.")
 
-    model_path = os.environ.pop("MLX_VLM_PRELOAD_MODEL", None)
-    adapter_path = os.environ.pop("MLX_VLM_PRELOAD_ADAPTER", None)
-    if model_path:
-        logger.info("Pre-loading language model: %s", model_path)
-        get_cached_model(model_path, adapter_path, model_kind="text_generation")
-        kv_bits = os.environ.get("KV_BITS")
-        kv_scheme = os.environ.get("KV_QUANT_SCHEME", "uniform")
-        if kv_bits:
-            logger.info("KV cache quantization: bits=%s scheme=%s", kv_bits, kv_scheme)
-        logger.info("Language model ready, continuous batching enabled.")
-
-    preload_models = (
-        (
-            os.environ.pop("MLX_VLM_PRELOAD_IMAGE_MODEL", None),
-            None,
-            "image_generation",
-            "image generation model",
-        ),
-        (
-            os.environ.pop("MLX_VLM_PRELOAD_TTS_MODEL", None),
-            None,
-            "audio_tts",
-            "text-to-speech model",
-        ),
-        (
-            os.environ.pop("MLX_VLM_PRELOAD_STT_MODEL", None),
-            None,
-            "audio_stt",
-            "speech-to-text model",
-        ),
-    )
-    for preload_model_path, preload_adapter_path, model_kind, label in preload_models:
-        if not preload_model_path:
-            continue
-        logger.info("Pre-loading %s: %s", label, preload_model_path)
-        get_cached_model(
-            preload_model_path,
-            preload_adapter_path,
-            model_kind=model_kind,
-        )
-        logger.info("%s ready.", label.capitalize())
-    _start_seed_prefix_warmup()
+    # Model preload + seed warmup run on a background thread with lifecycle
+    # phase tracking (see server/junie): the HTTP server is up immediately
+    # and inference gets 503 until the model is in.
+    start_background_model_load(_junie_deps)
     try:
         yield
     finally:
@@ -552,6 +527,16 @@ def get_cached_model(
     Factory function to get or load the appropriate model resources from cache or by loading.
     Also creates/updates the ResponseGenerator for continuous batching.
     """
+    busy_phase = lifecycle.busy_phase_for_caller()
+    if busy_phase is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Model serving is unavailable: server phase is '{busy_phase}'. "
+                "Poll GET /status and retry once the phase is 'ready'."
+            ),
+        )
+
     load_as_edit = model_kind == "image_edit"
     load_as_audio = _audio_model_kind(model_kind)
     load_as_image = model_kind == "image_generation" or (
@@ -828,6 +813,18 @@ _protocol_deps = SimpleNamespace(
 register_anthropic_routes(inference_router, _protocol_deps)
 register_openai_routes(inference_router, _protocol_deps)
 register_audio_routes(inference_router, _protocol_deps)
+
+_junie_deps = SimpleNamespace(
+    require_management_api_key=_require_management_api_key,
+    server_runtime_snapshot=_server_runtime_snapshot,
+    model_cache_registry=_model_cache_registry,
+    # Late-bound module globals so test monkeypatching keeps working.
+    get_cached_model=lambda *args, **kwargs: get_cached_model(*args, **kwargs),
+    unload_model_sync=lambda: unload_model_sync(),
+    start_seed_prefix_warmup=lambda **kwargs: _start_seed_prefix_warmup(**kwargs),
+    default_server_port=DEFAULT_SERVER_PORT,
+)
+register_control_routes(app, _junie_deps)
 
 
 @inference_router.get("/models", response_model=ModelsResponse)

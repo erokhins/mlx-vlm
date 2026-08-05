@@ -12,15 +12,30 @@ set -euo pipefail
 #
 # Steps 1-3 are no-ops when already done, so this is also the everyday
 # start command.
+#
+# The script is non-blocking and silent: it relaunches itself in the
+# background and returns immediately; all output goes to mlx_server.log.
+# Watch startup with GET /status (phase: loading_model -> warming_up ->
+# ready) and stop the server with POST /shutdown.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Everything below goes both to the screen and to mlx_server.log in the
-# repo dir (gitignored; truncated on each start).
-exec > >(tee "$SCRIPT_DIR/mlx_server.log") 2>&1
-
 PORT=8085
+LOG_FILE="$SCRIPT_DIR/mlx_server.log"
+
+if [ "${1:-}" != "--foreground" ]; then
+  # A server already answering on the port stays as it is.
+  if curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
+    exit 0
+  fi
+  nohup "$SCRIPT_DIR/start.sh" --foreground >/dev/null 2>&1 </dev/null &
+  exit 0
+fi
+
+# Everything below goes to mlx_server.log in the repo dir (gitignored;
+# truncated on each start).
+exec >"$LOG_FILE" 2>&1
 MODEL_ID="mlx-community/Qwen3.6-27B-4bit"
 # Multi-token-prediction speculative-decoding drafter for the model above.
 # It has no standalone language_model head, so it must be passed as
@@ -60,7 +75,7 @@ download_with_retry() {
 
   while [ "$attempt" -le "$max_retries" ]; do
     echo "  Attempt $attempt of $max_retries..."
-    if curl --progress-bar -SL -C - -o "$output_file" "$url"; then
+    if curl -sSL -C - -o "$output_file" "$url"; then
       return 0
     fi
 
