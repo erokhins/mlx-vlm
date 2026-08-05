@@ -54,6 +54,9 @@ def apply_inference_env(cfg: dict) -> None:
         "APC_DISK_PATH", os.path.expanduser(disk_path) if disk_path else None
     )
     set_or_unset("MLX_VLM_NGRAM_MAX", cfg.get("ngram_max"))
+    set_or_unset(
+        "MLX_VLM_MAX_CONCURRENT_REQUESTS", cfg.get("max_concurrent_requests")
+    )
 
 
 def build_argv(cfg: dict) -> List[str]:

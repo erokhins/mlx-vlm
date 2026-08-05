@@ -71,6 +71,11 @@ DEFAULT_CONFIG = {
     # pins ~11 GB during decode on 30k contexts; window 8 keeps the n-gram
     # speedup at ~1 GB (same wall time on the junie replay).
     "ngram_max": 8,
+    # Requests processed together by the batch engine. 1 = strictly one at
+    # a time (others wait in the queue; /status shows queue_depth) — the
+    # multi-request batching paths are avoided entirely. 0 = unlimited
+    # continuous batching.
+    "max_concurrent_requests": 1,
 }
 
 
@@ -108,6 +113,7 @@ _VALIDATORS = {
     "apc_session_checkpoints": _is_int_in(1, 64),
     "apc_disk_path": lambda v: v is None or isinstance(v, str),
     "ngram_max": _is_int_in(1, 1024),
+    "max_concurrent_requests": _is_int_in(0, 64),
 }
 
 

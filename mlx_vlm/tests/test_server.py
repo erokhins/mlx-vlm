@@ -651,6 +651,27 @@ def _unstarted_response_generator():
     return gen
 
 
+def test_collect_pending_requests_respects_max_items():
+    """max_items caps admission; the rest stay queued (serial mode)."""
+    gen = _unstarted_response_generator()
+    for i in range(3):
+        gen.requests.put(f"r{i}")
+
+    pending, stop = gen._collect_pending_requests(active=False, max_items=1)
+    assert pending == ["r0"] and not stop
+    assert gen.requests.qsize() == 2
+
+    # Zero capacity: engine full, nothing drained.
+    pending, stop = gen._collect_pending_requests(active=True, max_items=0)
+    assert pending == [] and not stop
+    assert gen.requests.qsize() == 2
+
+    # Unlimited drains the rest.
+    pending, stop = gen._collect_pending_requests(active=True)
+    assert pending == ["r1", "r2"] and not stop
+    assert gen.requests.qsize() == 0
+
+
 def test_server_demotes_incompatible_mtp_drafter_to_ar(monkeypatch):
     target_config = SimpleNamespace(
         model_type="gemma4_text",
@@ -5063,8 +5084,11 @@ class TestResponseGenerator:
             gen.draft_kind = "mtp"
             gen.tokenizer = SimpleNamespace()
 
-        def fake_collect_pending_requests(*, active, idle_timeout=0.1, coalesce_s=0.0):
+        def fake_collect_pending_requests(
+            *, active, idle_timeout=0.1, coalesce_s=0.0, max_items=None
+        ):
             del idle_timeout
+            assert max_items is None  # no concurrency limit configured
             calls.append((active, coalesce_s))
             return [], True
 

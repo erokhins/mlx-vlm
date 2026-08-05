@@ -360,6 +360,19 @@ def get_max_kv_size(model: str):
     return max_kv_tokens
 
 
+def get_max_concurrent_requests() -> int:
+    """Cap on requests processed together by the batch engine.
+
+    0 (default) = unlimited: continuous batching admits every queued
+    request. 1 serializes processing entirely — one request at a time,
+    the rest wait in the queue.
+    """
+    try:
+        return max(0, int(os.environ.get("MLX_VLM_MAX_CONCURRENT_REQUESTS", "0")))
+    except ValueError:
+        return 0
+
+
 def get_configured_context_limit():
     max_kv_tokens = int(os.environ.get("MAX_KV_SIZE", 0))
     return max_kv_tokens or None
@@ -1744,10 +1757,19 @@ class ResponseGenerator:
         active: bool,
         idle_timeout: float = 0.1,
         coalesce_s: float = 0.0,
+        max_items: Optional[int] = None,
     ):
-        """Collect the first queued request, then drain immediately available peers."""
+        """Collect the first queued request, then drain immediately available peers.
+
+        With ``max_items``, at most that many requests are taken; the rest
+        stay queued for later loop iterations (used to serialize request
+        processing via MLX_VLM_MAX_CONCURRENT_REQUESTS).
+        """
         pending = []
         should_stop = False
+
+        if max_items is not None and max_items <= 0:
+            return pending, should_stop
 
         def append_item(item):
             nonlocal should_stop
@@ -1768,7 +1790,7 @@ class ResponseGenerator:
         if pending and coalesce_s > 0:
             time.sleep(coalesce_s)
 
-        while not should_stop:
+        while not should_stop and (max_items is None or len(pending) < max_items):
             try:
                 append_item(self.requests.get_nowait())
             except QueueEmpty:
@@ -1805,15 +1827,23 @@ class ResponseGenerator:
         # getattr: tests build generators via __new__ without running __init__.
         active: dict = getattr(self, "_active_requests", {})
 
+        concurrency_limit = get_max_concurrent_requests()
+
         while not self._stop:
             try:
                 # Poll the request queue — non-blocking when generating, short
                 # blocking wait when idle so we don't spin.
                 active_batch = bool(active)
+                capacity = (
+                    None
+                    if concurrency_limit <= 0
+                    else max(0, concurrency_limit - len(active))
+                )
                 coalesce_s = (
                     get_speculative_batch_coalesce_s()
                     if (
                         not active_batch
+                        and capacity != 1
                         and self.draft_model is not None
                         and self.draft_kind == "mtp"
                     )
@@ -1822,6 +1852,7 @@ class ResponseGenerator:
                 new_items, should_stop = self._collect_pending_requests(
                     active=active_batch,
                     coalesce_s=coalesce_s,
+                    max_items=capacity,
                 )
                 if should_stop:
                     break
