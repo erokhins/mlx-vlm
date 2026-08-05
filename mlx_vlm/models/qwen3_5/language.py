@@ -1551,13 +1551,21 @@ class Qwen3_5Attention(nn.Module):
             output = None
 
         if output is None and target_verify and L > 1:
-            prefix_len = keys.shape[-2] - L
+            # A quantized KV cache returns (packed, scales, biases) tuples
+            # from update_and_fetch; the seq axis is -2 in every part.
+            def _kv_slice(kv, end):
+                if isinstance(kv, tuple):
+                    return tuple(part[:, :, :end, :] for part in kv)
+                return kv[:, :, :end, :]
+
+            k_len = (keys[0] if isinstance(keys, tuple) else keys).shape[-2]
+            prefix_len = k_len - L
             output = mx.concatenate(
                 [
                     scaled_dot_product_attention(
                         queries[:, :, i : i + 1, :],
-                        keys[:, :, : prefix_len + i + 1, :],
-                        values[:, :, : prefix_len + i + 1, :],
+                        _kv_slice(keys, prefix_len + i + 1),
+                        _kv_slice(values, prefix_len + i + 1),
                         cache=cache,
                         scale=self.scale,
                         mask=(

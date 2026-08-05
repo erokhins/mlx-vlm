@@ -1886,10 +1886,15 @@ class BatchQuantizedKVCache(_BaseCache):
         self._idx, self.group_size, self.bits = map(int, v)
 
     def is_trimmable(self):
-        return False
+        return True
 
     def trim(self, n):
-        return 0
+        # Same index-only trim as BatchKVCache: data past _idx is never
+        # returned and gets overwritten by the next update_and_fetch.
+        n = min(self._idx, n)
+        self._idx -= n
+        self.offset -= n
+        return n
 
     def empty(self):
         return self.keys is None
