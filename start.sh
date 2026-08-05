@@ -21,7 +21,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-PORT=8085
+BASE_DIR="$HOME/.local/share/junie-local"
+
+# Persistent server settings: model/drafter, the runtime settings the
+# /apply_settings API manages, and the launch settings (host/port, prefill
+# tuning, seed request, ...). The server reads it via
+# `python -m mlx_vlm.server.junie` and creates it with defaults on first
+# start; edit it by hand while the server is stopped.
+export JUNIE_SERVER_CONFIG="$BASE_DIR/server-config.json"
+
+# The port lives in the config file; fall back to the default until the
+# first start creates it.
+PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
+  "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
+PORT=${PORT:-8085}
+
 LOG_FILE="$SCRIPT_DIR/mlx_server.log"
 
 if [ "${1:-}" != "--foreground" ]; then
@@ -61,7 +75,6 @@ DRAFT_MODEL_ID="mlx-community/Qwen3.6-27B-MTP-4bit"
 #    cleanly).
 # ---------------------------------------------------------------------------
 BASE_URL="https://download.jetbrains.com/resources/junie-local"
-BASE_DIR="$HOME/.local/share/junie-local"
 MODELS_DIR="$BASE_DIR/models"
 DOWNLOAD_DIR="$BASE_DIR/incomplete_downloads"
 
@@ -265,12 +278,6 @@ fi
 export HF_HUB_CACHE="$MODELS_DIR"
 export HF_HUB_OFFLINE=1
 
-# Persistent settings (model, max_context_length, kv_quantization,
-# auto_unload_time). The server reads this file before loading the model
-# and rewrites it whenever POST /apply_settings succeeds, so settings
-# survive restarts. Created with defaults on first start.
-export JUNIE_SERVER_CONFIG="$BASE_DIR/server-config.json"
-
 # Make sure "import mlx_vlm" resolves to this checkout's sources, ahead of
 # any installed package.
 export PYTHONPATH="$SCRIPT_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -280,58 +287,16 @@ if [ ! -x "$PYTHON_BIN" ]; then
   PYTHON_BIN="python3"
 fi
 
-# Cross-request KV cache reuse (Automatic Prefix Caching). Qwen3.6 is a
-# hybrid linear-attention model, so APC uses session storage: ONE shared
-# full-attention KV set per conversation (~64 KiB/token, e.g. ~9 GiB at 150k)
-# plus small recurrent-state checkpoints at the last few prefix lengths, so
-# a warm hit can resume from any recent checkpoint -- including one before a
-# mid-history edit. Verify via "APC enabled (...)" and GET /v1/cache/stats.
-# Note: --preserve-thinking (below) is required for warm hits to survive new
-# user turns -- without it the Qwen3.6 chat template re-renders older
-# assistant turns (drops their <think> blocks) whenever a new user message
-# arrives, which changes the token stream mid-history and misses the cache.
-export APC_ENABLED=1
-export APC_EXACT_SESSIONS=2        # concurrent conversations kept warm
-export APC_SESSION_CHECKPOINTS=8   # resumable positions per conversation
-
-# Cap the n-gram prompt-lookup draft window (default doubles to 32 on full
-# accepts). Every drafted block is verified in one forward whose per-layer
-# GDN intermediate states scale with the block length — at window 32 that
-# transiently pins ~11 GB during decode on 30k contexts. Window 8 keeps the
-# n-gram speedup (measured: same wall time as 32 on the junie replay) at
-# ~1 GB instead.
-export MLX_VLM_NGRAM_MAX=8
-# Persist the pinned seed snapshot on SSD so it survives restarts (only the
-# seed is written -- APC_DISK_EXACT_SCOPE defaults to "pinned", so the disk
-# tier stays at ~1 GB instead of one multi-GB snapshot per request).
-export APC_DISK_PATH="$BASE_DIR/apc-cache"
-
-# Stable cross-session prompt prefix (Junie system message + tool schemas +
-# first user message; byte-identical across sessions). Prefilled once at
-# startup, pinned in APC (never evicted, doesn't count against
-# APC_EXACT_SESSIONS), and persisted via APC_DISK_PATH — so the FIRST
-# request of a brand-new Junie session already warm-starts. Watch for
-# "Seed prefix warmed and pinned" in the log.
-SEED_REQUEST="$SCRIPT_DIR/research/junie.json"
-
-# W8A8 int8 prefill on the M5 neural accelerators (see
-# research/int8-nax/README.md). int8 weight tensors are built per layer by a
-# fused kernel and freed right after use (MLX_VLM_INT8_CACHE=none default),
-# so peak memory overhead is ~one layer, not a 24 GB copy.
-# Prefill step 1024: each prefill chunk materializes per-layer attention
-# scores of step x context, so the step directly scales peak memory on long
-# contexts (sweep on 31.7k prompts: 4096 -> 36.9 GB peak @980 tok/s,
-# 1024 -> 28.6 GB @910 tok/s; warm-workload speed is identical). If a
-# quality issue shows up on real workloads, first try
-# MLX_VLM_INT8_SCOPE=mlp (keeps attention numerics untouched), then drop
-# --int8-prefill entirely.
-# The model and drafter are NOT passed here — the server picks them up
-# from the config file (JUNIE_SERVER_CONFIG above).
-exec "$PYTHON_BIN" -m mlx_vlm.server \
-  --host 0.0.0.0 \
-  --port "$PORT" \
-  --int8-prefill \
-  --prefill-step-size 1024 \
-  --preserve-thinking \
-  --seed-request "$SEED_REQUEST" \
-  --log-raw-tokens
+# No serving flags or inference env vars here: everything (host/port,
+# prefill tuning [int8_prefill, prefill_step_size], preserve_thinking,
+# seed_request, log_raw_tokens, APC [apc_enabled, apc_exact_sessions,
+# apc_session_checkpoints, apc_disk_path], ngram_max, model/drafter, KV
+# quantization, ...) lives in the config file (JUNIE_SERVER_CONFIG above).
+# The junie launcher reads it, exports the inference env vars and builds
+# the mlx_vlm.server command line; see DEFAULT_CONFIG in
+# mlx_vlm/server/junie/config.py for per-field docs, and
+# research/int8-nax/README.md for the int8-prefill background. seed_request
+# defaults to research/junie.json in this repo — the stable Junie prompt
+# prefix, prefilled and pinned at startup ("Seed prefix warmed and pinned"
+# in the log) so the first request of a brand-new session warm-starts.
+exec "$PYTHON_BIN" -m mlx_vlm.server.junie

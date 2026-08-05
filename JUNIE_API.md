@@ -166,8 +166,14 @@ Applied settings are **persisted** to
 effect), so they survive server restarts. That file — not `start.sh`
 flags — decides which model is served and with which settings; it is
 created with defaults on first start and can also be edited by hand while
-the server is stopped (it additionally holds `draft_model`/`draft_kind`,
-which are not settable through this endpoint).
+the server is stopped. Beyond the four API-settable fields it holds
+`draft_model`/`draft_kind` and the launch/inference settings (`host`,
+`port`, `int8_prefill`, `prefill_step_size`, `preserve_thinking`,
+`seed_request` — `null` means the repo's `research/junie.json`, `""`
+disables — `log_raw_tokens`, `apc_enabled`, `apc_exact_sessions`,
+`apc_session_checkpoints`, `apc_disk_path`, `ngram_max`), which are read
+once at startup by `python -m mlx_vlm.server.junie`. Per-field docs live
+in `DEFAULT_CONFIG` in `mlx_vlm/server/junie/config.py`.
 
 Request — any subset of:
 
