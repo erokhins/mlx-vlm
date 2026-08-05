@@ -20,10 +20,16 @@ set -euo pipefail
 #   ./serverctl.sh stop                     POST /shutdown (graceful)
 #   ./serverctl.sh health | models | metrics | cache-stats | cache-reset | unload
 #
-# PORT=8085 (default) selects the server; API_KEY adds a bearer token.
+# The port comes from server-config.json (PORT env overrides); API_KEY
+# adds a bearer token.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT="${PORT:-8085}"
+JUNIE_SERVER_CONFIG="${JUNIE_SERVER_CONFIG:-$HOME/.local/share/junie-local/server-config.json}"
+if [ -z "${PORT:-}" ]; then
+  PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
+    "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
+fi
+PORT="${PORT:-19239}"
 BASE="http://localhost:$PORT"
 
 usage() {

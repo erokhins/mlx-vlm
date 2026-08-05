@@ -1,9 +1,9 @@
 # Junie local server — HTTP API
 
-All endpoints live on one HTTP server (default `http://localhost:8085`,
-set by `PORT` in `start.sh`). The port never changes while the process is
-alive: settings changes restart *model serving* behind the API, not the
-HTTP server itself.
+All endpoints live on one HTTP server (default `http://localhost:19239`,
+set by `port` in `server-config.json`; localhost-only by default). The
+port never changes while the process is alive: settings changes restart
+*model serving* behind the API, not the HTTP server itself.
 
 Every endpoint below is also available with a `/v1` prefix
 (`/status` ≡ `/v1/status`, `/health` has no alias). When the server was

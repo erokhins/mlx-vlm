@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     # Localhost only by default — the server has no auth unless --api-key
     # is set; use "0.0.0.0" to expose it on the network.
     "host": "127.0.0.1",
-    "port": 8085,
+    "port": 19239,
     # W8A8 int8 prefill on the M5 neural accelerators (research/int8-nax).
     "int8_prefill": True,
     # Tokens per prefill chunk. Each chunk materializes per-layer attention

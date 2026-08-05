@@ -24,7 +24,7 @@ and prints nothing. All output goes to `mlx_server.log` in the repo dir
 inspect or share the log of the last run. Watch startup progress with:
 
 ```bash
-curl -s http://localhost:8085/status   # phase: loading_model -> warming_up -> ready
+curl -s http://localhost:19239/status   # phase: loading_model -> warming_up -> ready
 ```
 
 The first run takes a while; it automatically:
@@ -44,7 +44,7 @@ rewritten), so `./start.sh` is also the everyday start command; it's a
 no-op when the server is already up. Stop with:
 
 ```bash
-curl -s -X POST http://localhost:8085/shutdown
+curl -s -X POST http://localhost:19239/shutdown
 ```
 
 (`./start.sh --foreground` runs it in the current shell instead —
@@ -99,13 +99,13 @@ Full request/response examples for every endpoint: [JUNIE_API.md](JUNIE_API.md).
 
 | URL | What |
 |---|---|
-| `http://localhost:8085/v1/chat/completions` | OpenAI-compatible chat endpoint (this is what Junie calls); responses include a `timings` block with prefill/decode speeds and speculative-acceptance counters |
-| `http://localhost:8085/health` | liveness check |
-| `http://localhost:8085/status` | lifecycle phase (`loading_model` / `warming_up` / `ready` / `restarting` / `error`) plus live inference progress: per-request stage, prefill %, generated tokens |
-| `http://localhost:8085/current_settings` | the settings model serving currently runs with (port, model, context size, KV cache quantization, ...) |
-| `http://localhost:8085/apply_settings` | POST a JSON subset of `{model_name, max_context_length, kv_quantization, auto_unload_time, force}` — restarts model serving (not the HTTP server) with the new settings (`auto_unload_time` applies live); poll `/status` until `ready` |
-| `http://localhost:8085/shutdown` | POST — graceful shutdown of the whole server process |
-| `http://localhost:8085/v1/cache/stats` | APC stats: sessions, checkpoints, the pinned seed, hit counters |
+| `http://localhost:19239/v1/chat/completions` | OpenAI-compatible chat endpoint (this is what Junie calls); responses include a `timings` block with prefill/decode speeds and speculative-acceptance counters |
+| `http://localhost:19239/health` | liveness check |
+| `http://localhost:19239/status` | lifecycle phase (`loading_model` / `warming_up` / `ready` / `restarting` / `error`) plus live inference progress: per-request stage, prefill %, generated tokens |
+| `http://localhost:19239/current_settings` | the settings model serving currently runs with (model, context size, KV cache quantization, auto-unload) |
+| `http://localhost:19239/apply_settings` | POST a JSON subset of `{model_name, max_context_length, kv_quantization, auto_unload_time, force}` — restarts model serving (not the HTTP server) with the new settings (`auto_unload_time` applies live); poll `/status` until `ready` |
+| `http://localhost:19239/shutdown` | POST — graceful shutdown of the whole server process |
+| `http://localhost:19239/v1/cache/stats` | APC stats: sessions, checkpoints, the pinned seed, hit counters |
 
 ## What to expect in the log
 
@@ -120,14 +120,13 @@ Full request/response examples for every endpoint: [JUNIE_API.md](JUNIE_API.md).
 
 ## Tuning knobs (already set to measured optima)
 
-All optional; see `start.sh` comments and `research/mtp-overhead/README.md`
-for the measurements behind the defaults:
+Most knobs live in `server-config.json` (per-field docs in
+`DEFAULT_CONFIG`, `mlx_vlm/server/junie/config.py`): `ngram_max`,
+`apc_exact_sessions` / `apc_session_checkpoints`, `apc_disk_path`,
+`int8_prefill`, `prefill_step_size`, `host`/`port`. A few env-only extras:
 
-- `MLX_VLM_NGRAM_*` — n-gram prompt-lookup drafting (base window 4,
-  full-accept doubling to 32; `MLX_VLM_NGRAM_DRAFT=0` disables).
-- `APC_EXACT_SESSIONS` / `APC_SESSION_CHECKPOINTS` — warm-conversation
-  capacity.
+- `MLX_VLM_NGRAM_DRAFT=0` — disable n-gram prompt-lookup drafting.
 - `APC_DISK_EXACT_SCOPE=all` — persist every conversation snapshot to disk
   (default `pinned` keeps only the seed).
-- `MLX_VLM_INT8_SCOPE=mlp` or dropping `--int8-prefill` — fallback if
-  prefill quality issues ever show up.
+- `MLX_VLM_INT8_SCOPE=mlp` — fallback if int8 prefill quality issues ever
+  show up (keeps attention numerics untouched).

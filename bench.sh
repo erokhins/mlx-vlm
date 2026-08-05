@@ -8,7 +8,14 @@ set -euo pipefail
 # works however the server was started.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PORT=8085
+
+# The port lives in server-config.json (see start.sh); PORT env overrides.
+JUNIE_SERVER_CONFIG="${JUNIE_SERVER_CONFIG:-$HOME/.local/share/junie-local/server-config.json}"
+if [ -z "${PORT:-}" ]; then
+  PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
+    "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
+fi
+PORT=${PORT:-19239}
 
 if ! curl -sf -m 5 "http://localhost:$PORT/health" > /dev/null 2>&1; then
   echo "Server is not running on port $PORT."
