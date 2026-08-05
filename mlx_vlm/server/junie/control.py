@@ -34,6 +34,7 @@ from .lifecycle import (
     PHASE_WARMING_UP,
     lifecycle,
 )
+from .memory import memory_stats
 from .state import metrics_in_flight, reload_lock, serving_config
 from .watchdog import (
     AUTO_UNLOAD_TIME_ENV,
@@ -338,6 +339,7 @@ def register_control_routes(app, deps) -> None:
                 "draft_model": os.environ.get("MLX_VLM_DRAFT_MODEL"),
                 "context_limit": snapshot["effective_context_limit"],
             },
+            "memory": memory_stats(),
             "inference": {
                 "in_progress": in_flight > 0 or bool(progress),
                 "in_flight": in_flight,

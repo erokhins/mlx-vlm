@@ -80,6 +80,11 @@ Ready, with one request mid-prefill:
     "draft_model": "mlx-community/Qwen3.6-27B-MTP-4bit",
     "context_limit": 262144
   },
+  "memory": {
+    "total_gb": 19.06,
+    "peak_gb": 21.49,
+    "kv_cache_gb": 1.9
+  },
   "inference": {
     "in_progress": true,
     "in_flight": 1,
@@ -106,7 +111,15 @@ Fields:
   already serving; the pinned seed prefix is being prefilled.
 - `model.id` — the loaded model, or the configured one while loading.
 - `model.context_limit` — effective limit: `min` of the model's native
-  context and the configured `context_size`.
+  context and the configured `max_context_length`.
+- `memory.total_gb` — the server process's physical footprint (same number
+  Activity Monitor shows), including the model weights and all caches.
+- `memory.peak_gb` — lifetime maximum of that footprint (worst case this
+  run has needed).
+- `memory.kv_cache_gb` — in-RAM KV held by the prefix cache (warm
+  conversations + the pinned seed). This is the one part that can be
+  freed without unloading the model: `POST /v1/cache/reset` releases it
+  at the cost of the next requests re-prefilling their context.
 - `inference.requests[]` — one entry per in-flight batched request:
   - `stage` — `queued` → `prefill` → `decode`.
   - `prefill_progress` — `prefill_processed / prompt_tokens`, 0–1

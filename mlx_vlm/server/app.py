@@ -950,6 +950,11 @@ async def apc_cache_reset(request: Request):
     if runtime.apc_manager is None:
         return {"enabled": False}
     runtime.apc_manager.clear()
+    # Return the freed KV buffers to the OS instead of leaving them parked
+    # in the MLX buffer cache (same pattern as unload_model_sync).
+    gc.collect()
+    mx.synchronize()
+    mx.clear_cache()
     return {"enabled": True, "status": "cleared"}
 
 
