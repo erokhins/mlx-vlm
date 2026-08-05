@@ -14,13 +14,9 @@ set -euo pipefail
 # Steps 1-3 are no-ops when already done, so this is also the everyday
 # start command.
 #
-# The script is non-blocking and silent: it relaunches itself in the
-# background and returns immediately; all output goes to mlx_server.log.
-# Watch startup with GET /status (phase: loading_model -> warming_up ->
-# ready) and stop the server with POST /shutdown.
-#
-# Run `./start.sh --foreground` to stay attached with all output printed
-# to the terminal (nothing goes to mlx_server.log in this mode).
+# The script is blocking: it runs the server attached to the terminal
+# with all output printed to the screen. Stop it with Ctrl-C (or POST
+# /shutdown).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -40,16 +36,9 @@ PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
   "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
 PORT=${PORT:-8085}
 
-LOG_FILE="$SCRIPT_DIR/mlx_server.log"
-
-if [ "${1:-}" != "--foreground" ]; then
-  # A server already answering on the port stays as it is.
-  if curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
-    exit 0
-  fi
-  # The background child logs to mlx_server.log in the repo dir
-  # (gitignored; truncated on each start).
-  nohup "$SCRIPT_DIR/start.sh" --foreground >"$LOG_FILE" 2>&1 </dev/null &
+# A server already answering on the port stays as it is.
+if curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
+  echo "A server is already answering on http://localhost:$PORT; not starting."
   exit 0
 fi
 
