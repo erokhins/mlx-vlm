@@ -31,6 +31,7 @@ from .lifecycle import (
     PHASE_LOADING_MODEL,
     PHASE_READY,
     PHASE_RESTARTING,
+    PHASE_STOPPING,
     PHASE_WARMING_UP,
     lifecycle,
 )
@@ -412,7 +413,7 @@ def register_control_routes(app, deps) -> None:
 
         try:
             phase = lifecycle.phase()
-            if phase in (PHASE_LOADING_MODEL, PHASE_RESTARTING):
+            if phase in (PHASE_LOADING_MODEL, PHASE_RESTARTING, PHASE_STOPPING):
                 raise HTTPException(
                     status_code=409,
                     detail=f"Server is busy (phase '{phase}'); retry once it settles.",
@@ -460,8 +461,34 @@ def register_control_routes(app, deps) -> None:
     @app.post("/shutdown")
     @app.post("/v1/shutdown", include_in_schema=False)
     async def shutdown_endpoint(request: Request):
-        """Gracefully shut the whole server process down."""
+        """Shut the whole server process down.
+
+        In-flight generation is cancelled (clients get their partial
+        output) rather than awaited — uvicorn's graceful shutdown would
+        otherwise wait out a multi-minute generation. New inference is
+        rejected with 503 once the phase flips to "stopping". A SIGKILL
+        fallback caps a wedged shutdown at ~10 s.
+        """
         deps.require_management_api_key(request)
         logger.info("Shutdown requested via POST /shutdown.")
-        Timer(0.5, os.kill, args=(os.getpid(), signal.SIGTERM)).start()
+        lifecycle.set_phase(PHASE_STOPPING, "shutdown requested")
+
+        generator = runtime.response_generator
+        if generator is not None:
+            cancel = getattr(generator, "_cancel", None)
+            active = getattr(generator, "_active_requests", None)
+            if callable(cancel) and active:
+                for uid in list(active):
+                    cancel(uid)
+                logger.info(
+                    "Shutdown: cancelled %d in-flight generation request(s).",
+                    len(active),
+                )
+
+        for delay, sig in ((0.5, signal.SIGTERM), (10.0, signal.SIGKILL)):
+            timer = Timer(delay, os.kill, args=(os.getpid(), sig))
+            # Daemon: a clean exit must not wait for (or be killed by)
+            # the SIGKILL fallback.
+            timer.daemon = True
+            timer.start()
         return {"status": "shutting_down"}

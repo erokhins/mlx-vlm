@@ -16,6 +16,7 @@ PHASE_LOADING_MODEL = "loading_model"
 PHASE_WARMING_UP = "warming_up"
 PHASE_READY = "ready"
 PHASE_RESTARTING = "restarting"
+PHASE_STOPPING = "stopping"
 PHASE_ERROR = "error"
 
 # Phases during which the model is not available to serve inference. The
@@ -24,7 +25,7 @@ PHASE_ERROR = "error"
 # chat-completions request against the server itself. "starting" is not
 # busy so that embedding the app without the lifespan (e.g. tests) keeps
 # the lazy-load path working.
-_MODEL_BUSY_PHASES = (PHASE_LOADING_MODEL, PHASE_RESTARTING)
+_MODEL_BUSY_PHASES = (PHASE_LOADING_MODEL, PHASE_RESTARTING, PHASE_STOPPING)
 
 
 class LifecycleState:

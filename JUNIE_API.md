@@ -107,8 +107,9 @@ Ready, with one request mid-prefill:
 Fields:
 
 - `phase` — `starting` / `loading_model` / `warming_up` / `ready` /
-  `restarting` / `error`. `warming_up` means the model is loaded and
-  already serving; the pinned seed prefix is being prefilled.
+  `restarting` / `stopping` / `error`. `warming_up` means the model is
+  loaded and already serving; the pinned seed prefix is being prefilled.
+  `stopping` appears briefly after `POST /shutdown`.
 - `model.id` — the loaded model, or the configured one while loading.
 - `model.context_limit` — effective limit: `min` of the model's native
   context and the configured `max_context_length`.
@@ -229,14 +230,17 @@ Errors:
 
 ### `POST /shutdown`
 
-Graceful shutdown of the whole server process (empty body).
+Shut the whole server process down (empty body).
 
 ```json
 {"status": "shutting_down"}
 ```
 
-The process exits within a few seconds; afterwards the port stops
-answering. Start again with `./start.sh`.
+In-flight generation is **cancelled, not awaited**: clients receive
+whatever output was produced so far and the process exits in ~1 s
+(a SIGKILL fallback caps a wedged shutdown at ~10 s). New inference
+requests get `503` once the phase flips to `stopping`. Start again with
+`./start.sh`.
 
 ---
 
