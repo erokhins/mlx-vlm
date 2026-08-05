@@ -59,6 +59,10 @@ class LifecycleState:
         with self._lock:
             self._loader_thread_id = thread_id
 
+    def is_loader_thread(self) -> bool:
+        with self._lock:
+            return threading.get_ident() == self._loader_thread_id
+
     def phase(self) -> str:
         with self._lock:
             return self._phase

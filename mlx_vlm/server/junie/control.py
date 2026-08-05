@@ -85,6 +85,14 @@ def start_background_model_load(deps) -> None:
     runtime.on_generation_corrupted = (
         lambda reason: _restart_after_corruption(deps, reason)
     )
+    # Reloads of the configured model (after an idle auto-unload) must go
+    # through the guarded background loader: the lazy in-request load
+    # produced corrupted model state in ~90% of observed cycles.
+    runtime.on_text_model_load = (
+        lambda model_path, adapter_path: _reload_configured_model_guarded(
+            deps, model_path
+        )
+    )
     has_preload = any(
         os.environ.get(name)
         for name in (
@@ -169,6 +177,48 @@ def _load_configured_models(deps) -> None:
     finally:
         lifecycle.set_loader_thread(None)
     _finish_model_startup(deps)
+
+
+def _reload_configured_model_guarded(deps, model_path: str) -> None:
+    """Route a lazy reload of the configured model onto the guarded loader.
+
+    Called from get_cached_model on a text-model cache miss. For any model
+    other than the configured one this is a no-op (stock lazy behavior);
+    the guarded loader worker itself is exempt. Otherwise it kicks the
+    background reload (once — concurrent callers see the lock taken) and
+    answers 503 so the client retries against the freshly loaded model.
+    """
+    if serving_config.get("model_path") != model_path:
+        return
+    if lifecycle.is_loader_thread():
+        return
+    if reload_lock.acquire(blocking=False):
+        logger.info(
+            "Configured model requested after idle unload; reloading it on "
+            "the guarded background path."
+        )
+        lifecycle.set_phase(
+            PHASE_LOADING_MODEL, f"reloading {model_path} after idle unload"
+        )
+        Thread(
+            target=_apply_settings_worker,
+            args=(
+                deps,
+                model_path,
+                serving_config.get("adapter_path"),
+                {},
+                {},
+            ),
+            daemon=True,
+            name="idle-reload",
+        ).start()
+    raise HTTPException(
+        status_code=503,
+        detail=(
+            "Model is loading after an idle unload; retry shortly "
+            "(poll GET /status for phase 'ready')."
+        ),
+    )
 
 
 def _restart_after_corruption(deps, reason: str) -> None:

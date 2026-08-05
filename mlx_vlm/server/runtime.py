@@ -68,6 +68,11 @@ class ServerRuntime:
     # Hook invoked (from the generation thread) when corrupted generation
     # is detected; the control plane uses it to restart model serving.
     on_generation_corrupted: Optional[Any] = None
+    # Hook invoked before a text-generation model is loaded on a cache
+    # miss. The control plane uses it to route reloads of the configured
+    # model (e.g. after an idle auto-unload) onto its guarded background
+    # loader instead of the caller's thread; it may raise HTTPException.
+    on_text_model_load: Optional[Any] = None
 
 
 runtime = ServerRuntime()

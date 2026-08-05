@@ -582,6 +582,13 @@ def get_cached_model(
         logger.info("New %s model requested; clearing its existing cache.", cache_group)
         _unload_model_cache_group(cache_group)
 
+    # Text-model cache miss: let a registered control-plane hook redirect
+    # the load onto its guarded background loader (e.g. after an idle
+    # auto-unload) instead of loading on this thread. May raise
+    # HTTPException(503); a no-op when unregistered or not applicable.
+    if cache_group == "text_generation" and runtime.on_text_model_load is not None:
+        runtime.on_text_model_load(model_path, adapter_path)
+
     if load_as_edit:
         if adapter_path is not None:
             raise HTTPException(

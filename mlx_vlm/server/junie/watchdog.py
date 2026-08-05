@@ -89,7 +89,7 @@ def _maybe_auto_unload(deps) -> None:
             return
         logger.info(
             "Auto-unload: no inference activity for %.0fs (limit %ds); "
-            "unloading model. The next request reloads it.",
+            "unloading model. The next request triggers a guarded reload.",
             idle_s,
             timeout,
         )

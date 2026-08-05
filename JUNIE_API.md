@@ -151,7 +151,9 @@ The settings model serving is currently running with.
 - `auto_unload_time` — seconds of inference inactivity after which the
   model is unloaded from memory (`null` = never). After an auto-unload
   the server stays `ready` and `/status` shows `model.loaded: false`;
-  the next inference request reloads the model (that request is slow).
+  the next inference request triggers a background reload and gets `503`
+  (retry, or poll `/status` until `ready` — the phase shows
+  `loading_model` during the reload, then the seed warmup runs again).
 
 ### `POST /apply_settings`
 
