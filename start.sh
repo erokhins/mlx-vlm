@@ -18,6 +18,9 @@ set -euo pipefail
 # background and returns immediately; all output goes to mlx_server.log.
 # Watch startup with GET /status (phase: loading_model -> warming_up ->
 # ready) and stop the server with POST /shutdown.
+#
+# Run `./start.sh --foreground` to stay attached with all output printed
+# to the terminal (nothing goes to mlx_server.log in this mode).
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
@@ -44,13 +47,11 @@ if [ "${1:-}" != "--foreground" ]; then
   if curl -sf -m 2 "http://localhost:$PORT/health" >/dev/null 2>&1; then
     exit 0
   fi
-  nohup "$SCRIPT_DIR/start.sh" --foreground >/dev/null 2>&1 </dev/null &
+  # The background child logs to mlx_server.log in the repo dir
+  # (gitignored; truncated on each start).
+  nohup "$SCRIPT_DIR/start.sh" --foreground >"$LOG_FILE" 2>&1 </dev/null &
   exit 0
 fi
-
-# Everything below goes to mlx_server.log in the repo dir (gitignored;
-# truncated on each start).
-exec >"$LOG_FILE" 2>&1
 
 # These ids drive the weight download and the Junie descriptor below. The
 # model the server actually serves (and its MTP speculative-decoding
