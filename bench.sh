@@ -12,8 +12,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # The port lives in server-config.json (see start.sh); PORT env overrides.
 JUNIE_SERVER_CONFIG="${JUNIE_SERVER_CONFIG:-$HOME/.local/share/junie-local/server-config.json}"
 if [ -z "${PORT:-}" ]; then
+  # `|| true`: a missing config file fails the pipeline, and under
+  # `set -euo pipefail` that would abort silently.
   PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
-    "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
+    "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1 || true)
 fi
 PORT=${PORT:-19239}
 

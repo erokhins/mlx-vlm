@@ -32,9 +32,10 @@ BASE_DIR="$HOME/.local/share/junie-local"
 export JUNIE_SERVER_CONFIG="$BASE_DIR/server-config.json"
 
 # The port lives in the config file; fall back to the default until the
-# first start creates it.
+# first start creates it. `|| true` because a missing config file fails
+# the pipeline, and under `set -euo pipefail` that would abort silently.
 PORT=$(sed -n 's/^[[:space:]]*"port"[^0-9]*\([0-9][0-9]*\).*/\1/p' \
-  "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1)
+  "$JUNIE_SERVER_CONFIG" 2>/dev/null | head -1 || true)
 PORT=${PORT:-19239}
 
 LOG_FILE="$SCRIPT_DIR/mlx_server.log"
