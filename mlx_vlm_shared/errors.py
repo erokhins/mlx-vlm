@@ -7,6 +7,15 @@ OUT_OF_MEMORY_ERROR_CODE = "out_of_memory"
 OUT_OF_MEMORY_ERROR_MESSAGE = (
     "The inference worker ran out of memory and is restarting."
 )
+MEMORY_PRESSURE_ERROR_CODE = "memory_pressure"
+MEMORY_PRESSURE_ERROR_MESSAGE = (
+    "The inference worker was killed under critical memory pressure and is "
+    "restarting."
+)
+WORKER_CRASHED_ERROR_CODE = "worker_crashed"
+WORKER_CRASHED_ERROR_MESSAGE = (
+    "The inference worker crashed and is restarting."
+)
 
 _MLX_OUT_OF_MEMORY_MARKERS = (
     "[malloc] unable to allocate",

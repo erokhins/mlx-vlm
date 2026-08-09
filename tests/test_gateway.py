@@ -1012,6 +1012,144 @@ def test_worker_connection_failure_ignores_stale_oom_log(monkeypatch, tmp_path):
         _wait_until(lambda: len(processes) == 2)
 
 
+def test_sigkill_under_critical_memory_pressure_returns_memory_pressure(
+    monkeypatch,
+):
+    processes = None
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            processes[0].kill()
+            raise httpx.ConnectError("worker exited", request=request)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(monkeypatch, handler)
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+        app.state.memory_samples.append(
+            MemorySample(
+                timestamp=time.time(),
+                pressure="critical",
+                available_bytes=100,
+                worker_bytes=50,
+                worker_pid=processes[0].pid,
+            )
+        )
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "memory_pressure"
+        _wait_until(lambda: len(processes) == 2)
+
+
+def test_sigkill_without_critical_memory_pressure_returns_worker_crashed(
+    monkeypatch,
+):
+    processes = None
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            processes[0].kill()
+            raise httpx.ConnectError("worker exited", request=request)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(monkeypatch, handler)
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+        app.state.memory_samples.append(
+            MemorySample(
+                timestamp=time.time(),
+                pressure="normal",
+                available_bytes=100,
+                worker_bytes=50,
+                worker_pid=processes[0].pid,
+            )
+        )
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "worker_crashed"
+        _wait_until(lambda: len(processes) == 2)
+
+
+def test_sigkill_with_stale_critical_memory_sample_returns_worker_crashed(
+    monkeypatch,
+):
+    processes = None
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            processes[0].kill()
+            raise httpx.ConnectError("worker exited", request=request)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(monkeypatch, handler)
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+        app.state.memory_samples.append(
+            MemorySample(
+                timestamp=time.time() - 10,
+                pressure="critical",
+                available_bytes=100,
+                worker_bytes=50,
+                worker_pid=processes[0].pid,
+            )
+        )
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "worker_crashed"
+        _wait_until(lambda: len(processes) == 2)
+
+
+def test_fresh_oom_log_wins_over_critical_memory_pressure(monkeypatch, tmp_path):
+    log = tmp_path / "worker.log"
+    processes = None
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            with log.open("a") as stream:
+                stream.write(
+                    "[METAL] Command buffer execution failed: "
+                    "Insufficient Memory\n"
+                )
+            processes[0].kill()
+            raise httpx.ConnectError("worker exited", request=request)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(
+        monkeypatch, handler, worker_log_path=str(log)
+    )
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+        app.state.memory_samples.append(
+            MemorySample(
+                timestamp=time.time(),
+                pressure="critical",
+                available_bytes=100,
+                worker_bytes=50,
+                worker_pid=processes[0].pid,
+            )
+        )
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "out_of_memory"
+        _wait_until(lambda: len(processes) == 2)
+
+
 def test_hard_timeout_returns_504_and_restarts_worker(monkeypatch):
     def handler(request):
         if request.url.path == "/ready":

@@ -13,8 +13,12 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
 from mlx_vlm_shared.errors import (
+    MEMORY_PRESSURE_ERROR_CODE,
+    MEMORY_PRESSURE_ERROR_MESSAGE,
     OUT_OF_MEMORY_ERROR_CODE,
     OUT_OF_MEMORY_ERROR_MESSAGE,
+    WORKER_CRASHED_ERROR_CODE,
+    WORKER_CRASHED_ERROR_MESSAGE,
 )
 from mlx_vlm_shared.server_settings import (
     CONFIG_PATH_ENV,
@@ -23,7 +27,11 @@ from mlx_vlm_shared.server_settings import (
     load_config,
 )
 
-from .crash_diagnostics import capture_log_position, fresh_log_has_out_of_memory
+from .crash_diagnostics import (
+    capture_log_position,
+    fresh_log_has_out_of_memory,
+    latest_memory_was_critical,
+)
 from .memory_monitor import (
     MEMORY_SAMPLE_INTERVAL_S,
     MemorySample,
@@ -84,14 +92,14 @@ def _is_confirmed_out_of_memory(response: httpx.Response) -> bool:
     )
 
 
-def _out_of_memory_response() -> JSONResponse:
+def _server_error_response(code: str, message: str) -> JSONResponse:
     return JSONResponse(
         status_code=503,
         content={
             "error": {
-                "message": OUT_OF_MEMORY_ERROR_MESSAGE,
+                "message": message,
                 "type": "server_error",
-                "code": OUT_OF_MEMORY_ERROR_CODE,
+                "code": code,
             }
         },
     )
@@ -527,6 +535,7 @@ def create_app(
                     ),
                 ) from exc
             worker_generation = sup.generation
+            worker_process = sup.process
             request_log_position = capture_log_position(settings.worker_log_path)
 
             post_task = asyncio.create_task(
@@ -571,20 +580,56 @@ def create_app(
             ) from exc
         except httpx.RequestError as exc:
             sup.requests_failed += 1
+            worker_pid = None if worker_process is None else worker_process.pid
+            returncode = (
+                None if worker_process is None else worker_process.returncode
+            )
+            if worker_process is not None and returncode is None:
+                try:
+                    returncode = await asyncio.wait_for(
+                        worker_process.wait(), timeout=0.05
+                    )
+                except asyncio.TimeoutError:
+                    returncode = worker_process.returncode
             confirmed_oom = fresh_log_has_out_of_memory(
                 settings.worker_log_path, request_log_position
             )
-            sup.schedule_restart(
-                (
+            killed_under_memory_pressure = (
+                returncode == -9
+                and latest_memory_was_critical(
+                    request.app.state.memory_samples.snapshot(), worker_pid
+                )
+            )
+            worker_crashed = returncode is not None and returncode != 0
+            if confirmed_oom:
+                restart_reason = (
                     "worker log reported confirmed out-of-memory error after "
                     "connection failure"
-                    if confirmed_oom
-                    else f"worker connection failed during inference: {exc}"
-                ),
+                )
+            elif killed_under_memory_pressure:
+                restart_reason = "worker was killed under critical memory pressure"
+            elif worker_crashed:
+                restart_reason = (
+                    f"worker crashed during inference with exit code {returncode}"
+                )
+            else:
+                restart_reason = f"worker connection failed during inference: {exc}"
+            sup.schedule_restart(
+                restart_reason,
                 generation=worker_generation,
             )
             if confirmed_oom:
-                return _out_of_memory_response()
+                return _server_error_response(
+                    OUT_OF_MEMORY_ERROR_CODE, OUT_OF_MEMORY_ERROR_MESSAGE
+                )
+            if killed_under_memory_pressure:
+                return _server_error_response(
+                    MEMORY_PRESSURE_ERROR_CODE, MEMORY_PRESSURE_ERROR_MESSAGE
+                )
+            if worker_crashed:
+                return _server_error_response(
+                    WORKER_CRASHED_ERROR_CODE, WORKER_CRASHED_ERROR_MESSAGE
+                )
             raise HTTPException(
                 status_code=503,
                 detail="Inference worker restarted; please retry",
