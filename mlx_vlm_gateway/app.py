@@ -24,6 +24,12 @@ from mlx_vlm_shared.server_settings import (
 )
 
 from .crash_diagnostics import capture_log_position, fresh_log_has_out_of_memory
+from .memory_monitor import (
+    MEMORY_SAMPLE_INTERVAL_S,
+    MemorySample,
+    RecentMemorySamples,
+    read_memory_sample,
+)
 from .settings import RESTART_SETTING_KEYS, SettingsStore, SettingsValidationError
 from .supervisor import GatewaySettings, WorkerSupervisor, worker_command
 
@@ -95,7 +101,22 @@ def create_app(
     settings: GatewaySettings,
     client_factory: Optional[Callable[[httpx.Timeout], httpx.AsyncClient]] = None,
     shutdown_callback: Optional[Callable[[], None]] = None,
+    memory_sampler: Optional[Callable[[Optional[int]], MemorySample]] = None,
 ) -> FastAPI:
+    sample_memory = memory_sampler or read_memory_sample
+
+    async def record_recent_memory(app: FastAPI) -> None:
+        while True:
+            sup = app.state.supervisor
+            process = sup.process
+            worker_pid = (
+                process.pid
+                if process is not None and process.returncode is None
+                else None
+            )
+            app.state.memory_samples.append(sample_memory(worker_pid))
+            await asyncio.sleep(MEMORY_SAMPLE_INTERVAL_S)
+
     async def stop_idle_worker(app: FastAPI) -> None:
         while True:
             await asyncio.sleep(settings.idle_check_interval_s)
@@ -145,17 +166,27 @@ def create_app(
         app.state.lifecycle_lock = asyncio.Lock()
         app.state.shutting_down = False
         app.state.models_payload = None
+        app.state.memory_samples = RecentMemorySamples()
         await supervisor.open()
         idle_task = asyncio.create_task(
             stop_idle_worker(app),
             name="mlx-vlm-idle-worker-stop",
         )
+        memory_task = asyncio.create_task(
+            record_recent_memory(app),
+            name="mlx-vlm-memory-sampler",
+        )
         try:
             yield
         finally:
             idle_task.cancel()
+            memory_task.cancel()
             try:
                 await idle_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await memory_task
             except asyncio.CancelledError:
                 pass
             await supervisor.close()

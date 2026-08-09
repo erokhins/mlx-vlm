@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 
 import mlx_vlm_gateway.supervisor as supervisor_module
 from mlx_vlm_gateway.app import GatewaySettings, create_app
+from mlx_vlm_gateway.memory_monitor import MemorySample
 from mlx_vlm_gateway.supervisor import GATEWAY_PID_ENV
 
 
@@ -41,6 +42,7 @@ def _gateway(
     handler,
     *,
     shutdown_callback=None,
+    memory_sampler=None,
     **settings_overrides,
 ):
     processes = []
@@ -88,6 +90,7 @@ def _gateway(
             settings,
             client_factory=client_factory,
             shutdown_callback=shutdown_callback,
+            memory_sampler=memory_sampler,
         ),
         processes,
     )
@@ -100,6 +103,35 @@ def _wait_until(predicate, timeout=1.0):
             return
         time.sleep(0.01)
     raise AssertionError("condition did not become true")
+
+
+def test_gateway_records_memory_for_the_current_worker(monkeypatch):
+    sampled_pids = []
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        raise AssertionError(request.url.path)
+
+    def memory_sampler(pid):
+        sampled_pids.append(pid)
+        return MemorySample(
+            timestamp=time.time(),
+            pressure="normal",
+            available_bytes=100,
+            worker_bytes=50,
+            worker_pid=pid,
+        )
+
+    app, processes = _gateway(
+        monkeypatch, handler, memory_sampler=memory_sampler
+    )
+    with TestClient(app):
+        _wait_until(lambda: len(app.state.memory_samples) > 0)
+        sample = app.state.memory_samples.snapshot()[-1]
+
+    assert sample.worker_pid == processes[0].pid
+    assert sampled_pids[0] == processes[0].pid
 
 
 def test_worker_output_goes_to_the_configured_log(monkeypatch, tmp_path):
