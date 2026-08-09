@@ -2600,6 +2600,43 @@ def test_chat_completions_maps_corrupted_generation_to_508(client, monkeypatch):
     assert "corrupted output" in response.json()["detail"]
 
 
+def test_chat_completions_maps_out_of_memory_to_503(client, monkeypatch):
+    class OutOfMemoryResponseGenerator:
+        def generate(self, *args, **kwargs):
+            raise MemoryError("allocation failed")
+
+    model = SimpleNamespace()
+    processor = SimpleNamespace()
+    config = SimpleNamespace(model_type="qwen2_vl")
+
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
+    monkeypatch.setattr(
+        server.runtime, "response_generator", OutOfMemoryResponseGenerator()
+    )
+    monkeypatch.setattr(
+        server, "get_cached_model", MagicMock(return_value=(model, processor, config))
+    )
+    monkeypatch.setattr(server, "apply_chat_template", MagicMock(return_value="prompt"))
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={
+            "model": "demo",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "max_tokens": 4,
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json() == {
+        "error": {
+            "message": "The inference worker ran out of memory and is restarting.",
+            "type": "server_error",
+            "code": "out_of_memory",
+        }
+    }
+
+
 def test_chat_completions_endpoint_forwards_explicit_sampling_args(client):
     model = SimpleNamespace()
     processor = SimpleNamespace()

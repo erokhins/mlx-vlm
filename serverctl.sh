@@ -6,6 +6,7 @@ set -euo pipefail
 # Usage:
 #   ./serverctl.sh start                    launch the server (background, silent);
 #                                           from a checkout, ./init_dev.sh first
+#   ./serverctl.sh restart                  gracefully restart the managed server
 #   ./serverctl.sh status                   lifecycle phase + inference progress
 #   ./serverctl.sh wait                     poll status until phase is "ready"
 #   ./serverctl.sh settings                 current serving settings
@@ -17,11 +18,12 @@ set -euo pipefail
 #                                           numbers/true/false/null are sent as-is,
 #                                           anything else as a JSON string
 #   ./serverctl.sh apply-json '{"max_context_length": 150000}'
-#   ./serverctl.sh stop                     POST /shutdown (graceful)
+#   ./serverctl.sh stop                     gracefully stop and unregister it
 #   ./serverctl.sh health | models | metrics | cache-stats | unload
 #
-# Everything but "start" is plain HTTP, so this drives a checkout and the
-# frozen junie-mlx-vlm alike. PORT overrides the port read from the config.
+# HTTP commands drive a checkout and the frozen junie-mlx-vlm alike. Lifecycle
+# commands use the current user's launchd domain. PORT overrides the port read
+# from the config.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -31,15 +33,34 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # interpreter is needed; it fails alike on a missing file, a missing key and
 # unparsable contents, and any of those means "use the default".
 DEFAULT_PORT=19239
+DEFAULT_WORKER_PORT=19240
 CONFIG_PATH="${JUNIE_SERVER_CONFIG:-$HOME/.local/share/junie-local/server-config.json}"
 PORT="${PORT:-$(plutil -extract port raw -o - -- "$CONFIG_PATH" 2>/dev/null || true)}"
 case "$PORT" in
   '' | *[!0-9]*) PORT="$DEFAULT_PORT" ;;
+  *) [ "$PORT" -le 65535 ] && [ "$PORT" -gt 0 ] || PORT="$DEFAULT_PORT" ;;
+esac
+WORKER_PORT="$(plutil -extract worker_port raw -o - -- "$CONFIG_PATH" 2>/dev/null || true)"
+case "$WORKER_PORT" in
+  '' | *[!0-9]*) WORKER_PORT="$DEFAULT_WORKER_PORT" ;;
+  *)
+    [ "$WORKER_PORT" -le 65535 ] && [ "$WORKER_PORT" -gt 0 ] \
+      || WORKER_PORT="$DEFAULT_WORKER_PORT"
+    ;;
 esac
 BASE="http://localhost:$PORT"
+WORKER_BASE="http://localhost:$WORKER_PORT"
 
 # The daemon's own output, beside the worker log it writes itself.
 DAEMON_LOG="${CONFIG_PATH%/*}/junie-mlx-vlm-daemon.log"
+
+# One per-user LaunchAgent supervises only the gateway. The gateway remains
+# responsible for its inference worker, and the worker's parent watchdog
+# stops it when the gateway disappears.
+LAUNCHD_LABEL="${JUNIE_LAUNCHD_LABEL:-com.junie.mlx-vlm}"
+LAUNCHD_DOMAIN="gui/$(id -u)"
+LAUNCHD_SERVICE="$LAUNCHD_DOMAIN/$LAUNCHD_LABEL"
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/$LAUNCHD_LABEL.plist"
 
 usage() {
   sed -n '/^# Usage:/,/^$/{s/^# \{0,1\}//p;}' "${BASH_SOURCE[0]}"
@@ -93,16 +114,7 @@ kv_to_json() {
   echo "$json}"
 }
 
-# The one command that cannot be binary agnostic, because it has to know what
-# to run. It is the same command either way -- an unpacked tarball has the
-# junie-mlx-vlm binary beside this script, a checkout has it in the venv that
-# init_dev.sh builds, and it may simply be on PATH.
-start_server() {
-  if "${CURL[@]}" -o /dev/null -m 2 "$BASE/health" >/dev/null 2>&1; then
-    echo "Already serving on port $PORT."
-    return 0
-  fi
-
+find_server() {
   server=""
   for candidate in \
     "$SCRIPT_DIR/junie-mlx-vlm" \
@@ -120,19 +132,172 @@ start_server() {
     echo "       PATH. From a checkout, run ./init_dev.sh first." >&2
     exit 1
   fi
+  printf '%s\n' "$server"
+}
 
-  # The daemon writes the worker's log itself; this is its own output --
-  # its startup lines, uvicorn's, and anything that dies before logging
-  # exists. Kept one run back, the same way the daemon keeps the worker's.
+xml_escape() {
+  printf '%s' "$1" | sed \
+    -e 's/&/\&amp;/g' \
+    -e 's/</\&lt;/g' \
+    -e 's/>/\&gt;/g'
+}
+
+launchd_is_loaded() {
+  launchctl print "$LAUNCHD_SERVICE" >/dev/null 2>&1
+}
+
+launchd_pid() {
+  launchctl print "$LAUNCHD_SERVICE" 2>/dev/null \
+    | awk '/^[[:space:]]*pid = / { print $3; exit }'
+}
+
+port_is_listening() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+preflight_start() {
+  server="$1"
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "ERROR: lsof is required to verify that serving ports are free." >&2
+    return 1
+  fi
+  if ! "$server" --help >/dev/null 2>&1; then
+    echo "ERROR: $server exists but cannot be started." >&2
+    return 1
+  fi
+  if [ "$PORT" = "$WORKER_PORT" ]; then
+    echo "ERROR: gateway port $PORT and worker port $WORKER_PORT must differ." >&2
+    return 1
+  fi
+  for port in "$PORT" "$WORKER_PORT"; do
+    if port_is_listening "$port"; then
+      echo "ERROR: port $port is already in use." >&2
+      return 1
+    fi
+  done
+}
+
+write_launch_agent() {
+  server="$1"
+  mkdir -p "$(dirname "$LAUNCHD_PLIST")" "$(dirname "$DAEMON_LOG")"
+  tmp_plist="$LAUNCHD_PLIST.tmp.$$"
+  server_xml="$(xml_escape "$server")"
+  config_xml="$(xml_escape "$CONFIG_PATH")"
+  log_xml="$(xml_escape "$DAEMON_LOG")"
+  label_xml="$(xml_escape "$LAUNCHD_LABEL")"
+
+  cat >"$tmp_plist" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>$label_xml</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$server_xml</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>JUNIE_SERVER_CONFIG</key>
+    <string>$config_xml</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+  <key>StandardOutPath</key>
+  <string>$log_xml</string>
+  <key>StandardErrorPath</key>
+  <string>$log_xml</string>
+</dict>
+</plist>
+EOF
+
+  if ! plutil -lint "$tmp_plist" >/dev/null; then
+    rm -f "$tmp_plist"
+    echo "ERROR: generated an invalid LaunchAgent plist." >&2
+    return 1
+  fi
+  mv -f "$tmp_plist" "$LAUNCHD_PLIST"
+}
+
+prepare_daemon_log() {
   mkdir -p "$(dirname "$DAEMON_LOG")"
   if [ -f "$DAEMON_LOG" ]; then
     mv -f "$DAEMON_LOG" "$DAEMON_LOG.0"
   fi
+}
 
-  # Detached: the server outlives this shell, and says nothing here.
-  nohup "$server" >"$DAEMON_LOG" 2>&1 &
-  echo "Started $(basename "$server") (pid $!); logging to $DAEMON_LOG"
+wait_for_server_stop() {
+  attempts=0
+  while launchd_is_loaded \
+    || curl -sS -o /dev/null -m 1 "$BASE/health" >/dev/null 2>&1 \
+    || curl -sS -o /dev/null -m 1 "$WORKER_BASE/ready" >/dev/null 2>&1; do
+    attempts=$((attempts + 1))
+    if [ "$attempts" -ge 100 ]; then
+      echo "ERROR: server did not stop within 10 seconds." >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+# The one command that cannot be binary agnostic, because it has to know what
+# to run. It is the same command either way -- an unpacked tarball has the
+# junie-mlx-vlm binary beside this script, a checkout has it in the venv that
+# init_dev.sh builds, and it may simply be on PATH.
+start_server() {
+  server="$(find_server)"
+
+  if launchd_is_loaded; then
+    pid="$(launchd_pid)"
+    if [ -n "$pid" ]; then
+      echo "Already managed by launchd (pid $pid); use ./serverctl.sh wait."
+      return 0
+    fi
+    # The service exited cleanly (for example through POST /shutdown). Reload
+    # its plist so a moved checkout or replaced binary cannot leave launchd
+    # pointing at an obsolete absolute path.
+    launchctl bootout "$LAUNCHD_SERVICE"
+    wait_for_server_stop
+  fi
+
+  preflight_start "$server"
+  write_launch_agent "$server"
+  prepare_daemon_log
+  launchctl bootstrap "$LAUNCHD_DOMAIN" "$LAUNCHD_PLIST"
+  echo "Started $LAUNCHD_LABEL through launchd; logging to $DAEMON_LOG"
   echo "Follow it with ./serverctl.sh wait"
+}
+
+stop_server() {
+  if launchd_is_loaded; then
+    launchctl bootout "$LAUNCHD_SERVICE"
+    rm -f "$LAUNCHD_PLIST"
+    wait_for_server_stop
+    echo "Stopped $LAUNCHD_LABEL and removed its LaunchAgent."
+    return 0
+  fi
+
+  # Backward-compatible cleanup for a daemon started by the old nohup path.
+  rm -f "$LAUNCHD_PLIST"
+  if curl -sS -o /dev/null -m 2 "$BASE/health" >/dev/null 2>&1; then
+    post /shutdown
+    wait_for_server_stop
+  else
+    echo "Server is already stopped."
+  fi
+}
+
+restart_server() {
+  stop_server
+  start_server
 }
 
 wait_ready() {
@@ -156,6 +321,7 @@ cmd="${1:-}"
 
 case "$cmd" in
   start) start_server ;;
+  restart) restart_server ;;
   status) get /status ;;
   wait) wait_ready ;;
   settings) get /current_settings ;;
@@ -167,7 +333,7 @@ case "$cmd" in
     [ $# -eq 1 ] || usage
     post /apply_settings "$1"
     ;;
-  stop) post /shutdown ;;
+  stop) stop_server ;;
   health) get /health ;;
   models) get /v1/models ;;
   metrics) get /metrics ;;
