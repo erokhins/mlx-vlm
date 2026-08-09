@@ -12,6 +12,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from mlx_vlm_shared.errors import OUT_OF_MEMORY_ERROR_CODE
 from mlx_vlm_shared.server_settings import (
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_PATH,
@@ -56,6 +57,20 @@ def _proxy_response(response: httpx.Response) -> Response:
         content=response.content,
         status_code=response.status_code,
         headers=headers,
+    )
+
+
+def _is_confirmed_out_of_memory(response: httpx.Response) -> bool:
+    if response.status_code != 503:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == OUT_OF_MEMORY_ERROR_CODE
     )
 
 
@@ -519,6 +534,13 @@ def create_app(
             sup.active_requests = max(0, sup.active_requests - 1)
             sup.last_activity_at = time.monotonic()
 
+        if _is_confirmed_out_of_memory(response):
+            sup.requests_failed += 1
+            sup.schedule_restart(
+                "worker reported confirmed out-of-memory error",
+                generation=worker_generation,
+            )
+            return _proxy_response(response)
         if response.status_code == 508:
             # The worker's private corrupted-generation signal (token-id-0
             # loop): restart it immediately and tell the client to retry —

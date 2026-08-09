@@ -3,6 +3,11 @@
 from collections.abc import Iterator
 
 
+OUT_OF_MEMORY_ERROR_CODE = "out_of_memory"
+OUT_OF_MEMORY_ERROR_MESSAGE = (
+    "The inference worker ran out of memory and is restarting."
+)
+
 _MLX_OUT_OF_MEMORY_MARKERS = (
     "[malloc] unable to allocate",
     "[metal::malloc] attempting to allocate",

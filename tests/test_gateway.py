@@ -605,6 +605,52 @@ def test_worker_508_returns_503_and_restarts_worker(monkeypatch):
         _wait_until(lambda: len(processes) == 2)
 
 
+def test_confirmed_worker_oom_returns_error_and_restarts_worker(monkeypatch):
+    error_payload = {
+        "error": {
+            "message": "The inference worker ran out of memory and is restarting.",
+            "type": "server_error",
+            "code": "out_of_memory",
+        }
+    }
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(503, json=error_payload)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(monkeypatch, handler)
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+        assert len(processes) == 1
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json() == error_payload
+        _wait_until(lambda: len(processes) == 2)
+
+
+def test_worker_503_without_oom_code_does_not_restart_worker(monkeypatch):
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            return httpx.Response(503, json={"detail": "temporarily unavailable"})
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(monkeypatch, handler)
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert len(processes) == 1
+
+
 def test_client_disconnect_aborts_worker_request(monkeypatch):
     # TestClient cannot hang up mid-request, so this drives the ASGI app
     # directly: body first, then http.disconnect while the worker "runs".
