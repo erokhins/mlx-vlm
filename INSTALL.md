@@ -41,8 +41,9 @@ The project is installed editable, so the `junie-mlx-vlm` it puts in
 
 `serverctl.sh start` is the entrypoint in both worlds: it runs that
 `junie-mlx-vlm` from a checkout, and the frozen one from
-`build_cli_tarball.sh` beside it on a shipped machine. It returns
-immediately and leaves the daemon running in the background.
+`build_cli_tarball.sh` beside it on a shipped machine. It installs a per-user
+macOS LaunchAgent and returns immediately. `launchd` restarts the gateway if
+it crashes; the gateway still owns and supervises the inference worker.
 
 The daemon reads every setting from `server-config.json`, serves the public
 API on its `host`/`port` (`0.0.0.0:19239` by default), and spawns the
@@ -53,7 +54,9 @@ new sessions warm-start — is **currently disabled** pending rework. Point
 `seed_request` at a chat-completions request body to turn it back on for one
 machine; nothing does so by default.
 
-Stop it with `./serverctl.sh stop`, which releases the model memory.
+Stop it with `./serverctl.sh stop`. This unregisters the LaunchAgent, stops
+the gateway and worker gracefully, and releases the model memory. Because the
+plist is removed, a manual stop stays stopped after the next login.
 
 Model weights and the Junie model descriptor are **not** installed by this
 script — see [Prerequisites](#2-prerequisites).
@@ -83,6 +86,7 @@ are fully KV-cached.)
 | Path | What |
 |---|---|
 | `<repo>/.venv/` | Python virtualenv (created on first run) |
+| `~/Library/LaunchAgents/com.junie.mlx-vlm.plist` | per-user launchd service created by `serverctl.sh start` and removed by `serverctl.sh stop` |
 | `~/.local/share/junie-local/junie-mlx-vlm-daemon.log` | the daemon's own output; previous run kept as `.log.0` |
 | `~/.local/share/junie-local/junie-mlx-vlm.log` | the inference worker's output, appended across restarts within a run; previous run kept as `.log.0` |
 | `~/.local/share/junie-local/server-config.json` | the only config: model, models dir, host/port, worker port, context, KV quantization, idle timeout, and worker launch settings (override its location with `JUNIE_SERVER_CONFIG`) |
@@ -111,7 +115,9 @@ are fully KV-cached.)
 The gateway stays available if MLX or the worker process crashes. It returns
 `503` for the interrupted request and starts a fresh worker. A manual
 settings restart is rejected with `409` while inference is active unless the
-request contains `"force": true`.
+request contains `"force": true`. If the gateway process itself crashes,
+`launchd` starts a new gateway; the old worker's parent watchdog stops that
+worker, and the new gateway starts a replacement.
 
 Use the control script instead of hand-written curl commands:
 
@@ -121,6 +127,7 @@ Use the control script instead of hand-written curl commands:
 ./serverctl.sh apply auto_unload_time=600
 ./serverctl.sh apply max_context_length=150000
 ./serverctl.sh wait
+./serverctl.sh restart
 ./serverctl.sh stop
 ```
 
