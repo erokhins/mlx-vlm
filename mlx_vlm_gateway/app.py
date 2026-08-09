@@ -12,7 +12,10 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
-from mlx_vlm_shared.errors import OUT_OF_MEMORY_ERROR_CODE
+from mlx_vlm_shared.errors import (
+    OUT_OF_MEMORY_ERROR_CODE,
+    OUT_OF_MEMORY_ERROR_MESSAGE,
+)
 from mlx_vlm_shared.server_settings import (
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_PATH,
@@ -20,6 +23,7 @@ from mlx_vlm_shared.server_settings import (
     load_config,
 )
 
+from .crash_diagnostics import capture_log_position, fresh_log_has_out_of_memory
 from .settings import RESTART_SETTING_KEYS, SettingsStore, SettingsValidationError
 from .supervisor import GatewaySettings, WorkerSupervisor, worker_command
 
@@ -71,6 +75,19 @@ def _is_confirmed_out_of_memory(response: httpx.Response) -> bool:
     return (
         isinstance(error, dict)
         and error.get("code") == OUT_OF_MEMORY_ERROR_CODE
+    )
+
+
+def _out_of_memory_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": OUT_OF_MEMORY_ERROR_MESSAGE,
+                "type": "server_error",
+                "code": OUT_OF_MEMORY_ERROR_CODE,
+            }
+        },
     )
 
 
@@ -479,6 +496,7 @@ def create_app(
                     ),
                 ) from exc
             worker_generation = sup.generation
+            request_log_position = capture_log_position(settings.worker_log_path)
 
             post_task = asyncio.create_task(
                 request.app.state.client.post(
@@ -522,10 +540,20 @@ def create_app(
             ) from exc
         except httpx.RequestError as exc:
             sup.requests_failed += 1
+            confirmed_oom = fresh_log_has_out_of_memory(
+                settings.worker_log_path, request_log_position
+            )
             sup.schedule_restart(
-                f"worker connection failed during inference: {exc}",
+                (
+                    "worker log reported confirmed out-of-memory error after "
+                    "connection failure"
+                    if confirmed_oom
+                    else f"worker connection failed during inference: {exc}"
+                ),
                 generation=worker_generation,
             )
+            if confirmed_oom:
+                return _out_of_memory_response()
             raise HTTPException(
                 status_code=503,
                 detail="Inference worker restarted; please retry",

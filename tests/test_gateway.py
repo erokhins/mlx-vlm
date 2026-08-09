@@ -927,6 +927,59 @@ def test_worker_connection_failure_returns_503_and_restarts(monkeypatch):
         _wait_until(lambda: len(processes) == 2)
 
 
+def test_worker_connection_failure_with_fresh_oom_log_returns_oom(
+    monkeypatch, tmp_path
+):
+    log = tmp_path / "worker.log"
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            with log.open("a") as stream:
+                stream.write(
+                    "[METAL] Command buffer execution failed: Insufficient Memory\n"
+                )
+            raise httpx.ConnectError("worker exited", request=request)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(
+        monkeypatch, handler, worker_log_path=str(log)
+    )
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "out_of_memory"
+        _wait_until(lambda: len(processes) == 2)
+
+
+def test_worker_connection_failure_ignores_stale_oom_log(monkeypatch, tmp_path):
+    log = tmp_path / "worker.log"
+    log.write_text("[METAL] Command buffer execution failed: Insufficient Memory\n")
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(200, json={"status": "ready"})
+        if request.url.path == "/v1/chat/completions":
+            raise httpx.ConnectError("worker exited", request=request)
+        raise AssertionError(request.url.path)
+
+    app, processes = _gateway(
+        monkeypatch, handler, worker_log_path=str(log)
+    )
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/ready").status_code == 200)
+
+        response = client.post("/v1/chat/completions", json={})
+
+        assert response.status_code == 503
+        assert response.json()["detail"] == "Inference worker restarted; please retry"
+        _wait_until(lambda: len(processes) == 2)
+
+
 def test_hard_timeout_returns_504_and_restarts_worker(monkeypatch):
     def handler(request):
         if request.url.path == "/ready":

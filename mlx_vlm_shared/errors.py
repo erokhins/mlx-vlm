@@ -33,8 +33,13 @@ def is_out_of_memory_error(error: BaseException) -> bool:
         if isinstance(item, MemoryError):
             return True
 
-        message = str(item).lower()
-        if any(marker in message for marker in _MLX_OUT_OF_MEMORY_MARKERS):
+        if is_out_of_memory_message(str(item)):
             return True
 
     return False
+
+
+def is_out_of_memory_message(message: str) -> bool:
+    """Return whether text contains a confirmed MLX OOM marker."""
+    normalized = message.lower()
+    return any(marker in normalized for marker in _MLX_OUT_OF_MEMORY_MARKERS)
