@@ -38,10 +38,15 @@ CONFIG_PATH="${JUNIE_SERVER_CONFIG:-$HOME/.local/share/junie-local/server-config
 PORT="${PORT:-$(plutil -extract port raw -o - -- "$CONFIG_PATH" 2>/dev/null || true)}"
 case "$PORT" in
   '' | *[!0-9]*) PORT="$DEFAULT_PORT" ;;
+  *) [ "$PORT" -le 65535 ] && [ "$PORT" -gt 0 ] || PORT="$DEFAULT_PORT" ;;
 esac
 WORKER_PORT="$(plutil -extract worker_port raw -o - -- "$CONFIG_PATH" 2>/dev/null || true)"
 case "$WORKER_PORT" in
   '' | *[!0-9]*) WORKER_PORT="$DEFAULT_WORKER_PORT" ;;
+  *)
+    [ "$WORKER_PORT" -le 65535 ] && [ "$WORKER_PORT" -gt 0 ] \
+      || WORKER_PORT="$DEFAULT_WORKER_PORT"
+    ;;
 esac
 BASE="http://localhost:$PORT"
 WORKER_BASE="http://localhost:$WORKER_PORT"
@@ -146,6 +151,32 @@ launchd_pid() {
     | awk '/^[[:space:]]*pid = / { print $3; exit }'
 }
 
+port_is_listening() {
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+preflight_start() {
+  server="$1"
+  if ! command -v lsof >/dev/null 2>&1; then
+    echo "ERROR: lsof is required to verify that serving ports are free." >&2
+    return 1
+  fi
+  if ! "$server" --help >/dev/null 2>&1; then
+    echo "ERROR: $server exists but cannot be started." >&2
+    return 1
+  fi
+  if [ "$PORT" = "$WORKER_PORT" ]; then
+    echo "ERROR: gateway port $PORT and worker port $WORKER_PORT must differ." >&2
+    return 1
+  fi
+  for port in "$PORT" "$WORKER_PORT"; do
+    if port_is_listening "$port"; then
+      echo "ERROR: port $port is already in use." >&2
+      return 1
+    fi
+  done
+}
+
 write_launch_agent() {
   server="$1"
   mkdir -p "$(dirname "$LAUNCHD_PLIST")" "$(dirname "$DAEMON_LOG")"
@@ -230,17 +261,14 @@ start_server() {
       echo "Already managed by launchd (pid $pid); use ./serverctl.sh wait."
       return 0
     fi
-    pid="$(launchctl kickstart -p "$LAUNCHD_SERVICE")"
-    echo "Started $LAUNCHD_LABEL through launchd (pid $pid)."
-    return 0
+    # The service exited cleanly (for example through POST /shutdown). Reload
+    # its plist so a moved checkout or replaced binary cannot leave launchd
+    # pointing at an obsolete absolute path.
+    launchctl bootout "$LAUNCHD_SERVICE"
+    wait_for_server_stop
   fi
 
-  if curl -sS -o /dev/null -m 2 "$BASE/health" >/dev/null 2>&1; then
-    echo "ERROR: port $PORT is served by an unmanaged process." >&2
-    echo "       Stop that process before enabling launchd supervision." >&2
-    return 1
-  fi
-
+  preflight_start "$server"
   write_launch_agent "$server"
   prepare_daemon_log
   launchctl bootstrap "$LAUNCHD_DOMAIN" "$LAUNCHD_PLIST"
