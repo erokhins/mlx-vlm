@@ -760,11 +760,22 @@ def main(argv: Optional[Sequence[str]] = None):
         settings.worker_log_path,
         settings.worker_log_path,
     )
-    uvicorn.run(
-        create_app(settings),
+    server = None
+
+    def request_shutdown() -> None:
+        # A normal API shutdown must exit with status 0. Sending SIGTERM to
+        # ourselves looks like a crash to launchd's SuccessfulExit policy and
+        # causes an unwanted restart.
+        if server is not None:
+            server.should_exit = True
+
+    uvicorn_config = uvicorn.Config(
+        create_app(settings, shutdown_callback=request_shutdown),
         host=config["host"],
         port=config["port"],
         workers=1,
         server_header=False,
         log_level="info",
     )
+    server = uvicorn.Server(uvicorn_config)
+    server.run()
