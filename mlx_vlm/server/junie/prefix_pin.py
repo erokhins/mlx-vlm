@@ -1,12 +1,13 @@
 """Pin the stable Junie prompt prefix's KV in the APC cache.
 
 Junie's chat/completions bodies share a long stable prefix: the system
-message (plus tool schemas the template renders into it) — everything
-before the user message that opens with ``## ISSUE DESCRIPTION``. The
-chat endpoint uses this boundary to pin that prefix's KV snapshot in APC
-during the request's own prefill and persist it to the APC disk tier,
-which is what makes the first request of a new session — including right
-after a restart — start warm instead of re-prefilling ~15k tokens.
+message (plus tool schemas the template renders into it). The prefix ends
+before either compressed history or the user message that opens with
+``## ISSUE DESCRIPTION``. The chat endpoint uses this boundary to pin that
+prefix's KV snapshot in APC during the request's own prefill and persist it
+to the APC disk tier, which is what makes the first request of a new session
+— including right after a restart — start warm instead of re-prefilling
+~15k tokens.
 
 Enabled by ``MLX_VLM_PIN_STABLE_PREFIX`` (the number of snapshots the
 disk tier keeps, exported by the launcher from the ``pin_stable_prefix``
@@ -20,11 +21,12 @@ from typing import Any, List, Optional
 logger = logging.getLogger("mlx_vlm.server")
 
 
-# Junie renders the issue as a user message opening with this header; the
-# messages before it are the cross-conversation stable prefix. The
+# Junie renders the issue as a user message opening with this header. The
 # <issue_description> tag itself is no boundary marker — the system prompt
 # mentions it too.
 ISSUE_HEADER = "## ISSUE DESCRIPTION"
+# History compression inserts dynamic user messages before the issue.
+HISTORY_PROCESSOR_PREFIX = "History processor:"
 
 
 def _message_text(content: Any) -> str:
@@ -38,13 +40,17 @@ def _message_text(content: Any) -> str:
 
 
 def stable_prefix_messages(messages: List[Any]) -> Optional[List[Any]]:
-    """The messages before the issue-description message, or None."""
+    """The stable messages before compressed history and the issue, or None."""
+    stable_end = None
     for index, message in enumerate(messages):
         if not isinstance(message, dict):
             return None
-        text = _message_text(message.get("content"))
-        if text.lstrip().startswith(ISSUE_HEADER):
-            return messages[:index] if index else None
+        text = _message_text(message.get("content")).lstrip()
+        if text.startswith(HISTORY_PROCESSOR_PREFIX) and stable_end is None:
+            stable_end = index
+        if text.startswith(ISSUE_HEADER):
+            boundary = stable_end if stable_end is not None else index
+            return messages[:boundary] if boundary else None
     return None
 
 
