@@ -44,8 +44,11 @@ def test_latest_memory_sample_must_be_fresh_and_critical():
     assert latest_memory_was_critical(
         [_memory_sample(99.0, "critical")], 123, now=100.0
     )
-    assert not latest_memory_was_critical(
+    assert latest_memory_was_critical(
         [_memory_sample(90.0, "critical")], 123, now=100.0
+    )
+    assert not latest_memory_was_critical(
+        [_memory_sample(80.0, "critical")], 123, now=100.0
     )
     assert not latest_memory_was_critical(
         [

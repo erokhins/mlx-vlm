@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 
 
-MEMORY_SAMPLE_INTERVAL_S = 1.0
+MEMORY_SAMPLE_INTERVAL_S = 10.0
 MEMORY_SAMPLE_LIMIT = 20
 
 _PRESSURE_NORMAL = 1

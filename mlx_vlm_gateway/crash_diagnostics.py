@@ -6,11 +6,11 @@ from collections.abc import Iterable
 
 from mlx_vlm_shared.errors import is_out_of_memory_message
 
-from .memory_monitor import MemorySample
+from .memory_monitor import MEMORY_SAMPLE_INTERVAL_S, MemorySample
 
 
 MAX_FRESH_LOG_BYTES = 64 * 1024
-RECENT_MEMORY_SAMPLE_MAX_AGE_S = 3.0
+RECENT_MEMORY_SAMPLE_MAX_AGE_S = MEMORY_SAMPLE_INTERVAL_S * 1.5
 
 
 def capture_log_position(path: str | None) -> int | None:

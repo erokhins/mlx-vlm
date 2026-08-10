@@ -1096,7 +1096,7 @@ def test_sigkill_with_stale_critical_memory_sample_returns_worker_crashed(
         _wait_until(lambda: client.get("/ready").status_code == 200)
         app.state.memory_samples.append(
             MemorySample(
-                timestamp=time.time() - 10,
+                timestamp=time.time() - 20,
                 pressure="critical",
                 available_bytes=100,
                 worker_bytes=50,
