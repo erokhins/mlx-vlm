@@ -435,6 +435,28 @@ class OpenAIUsage(BaseModel):
         )
 
 
+class GenerationTimingAverages(BaseModel):
+    """Aggregate performance across completed requests since worker start."""
+
+    requests: int
+    prompt_ms: float
+    prompt_per_second: float
+    predicted_ms: float
+    predicted_per_second: float
+    cache_reuse_percent: float
+
+    @classmethod
+    def from_summary(cls, summary: dict) -> "GenerationTimingAverages":
+        return cls(
+            requests=int(summary.get("requests_completed") or 0),
+            prompt_ms=1000.0 * float(summary.get("avg_prefill_time_s") or 0.0),
+            prompt_per_second=float(summary.get("avg_prefill_tok_s") or 0.0),
+            predicted_ms=(1000.0 * float(summary.get("avg_generation_time_s") or 0.0)),
+            predicted_per_second=float(summary.get("avg_decode_tok_s") or 0.0),
+            cache_reuse_percent=float(summary.get("avg_kv_cache_reuse_percent") or 0.0),
+        )
+
+
 class GenerationTimings(BaseModel):
     """Per-request timing breakdown."""
 
@@ -447,6 +469,8 @@ class GenerationTimings(BaseModel):
     predicted_ms: float
     predicted_per_token_ms: float
     predicted_per_second: float
+    cache_reuse_percent: float
+    averages: Optional[GenerationTimingAverages] = None
     peak_memory: float = 0.0
     # Speculative decoding (when a drafter is active). draft_n /
     # draft_n_accepted follow llama.cpp's timings naming and cover ALL
@@ -472,6 +496,7 @@ class GenerationTimings(BaseModel):
         metrics: "GenerationMetrics",
         prompt_tokens: int,
         output_tokens: int,
+        averages: Optional[dict] = None,
     ) -> "GenerationTimings":
         generation_tps = getattr(metrics, "rate", None)
         if generation_tps is None:
@@ -498,6 +523,16 @@ class GenerationTimings(BaseModel):
                 predicted_ms / output_tokens if output_tokens else 0.0
             ),
             predicted_per_second=float(generation_tps or 0.0),
+            cache_reuse_percent=(
+                100.0 * int(cached_tokens) / int(prompt_tokens)
+                if prompt_tokens
+                else 0.0
+            ),
+            averages=(
+                GenerationTimingAverages.from_summary(averages)
+                if averages is not None
+                else None
+            ),
             peak_memory=float(metrics.peak_memory or 0.0),
             draft_n=spec.get("draft_n"),
             draft_n_accepted=spec.get("draft_n_accepted"),

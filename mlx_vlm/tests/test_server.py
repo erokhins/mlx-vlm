@@ -709,9 +709,7 @@ def test_zero_token_run_fails_request_with_corruption_error(monkeypatch):
     while not rqueue.empty():
         items.append(rqueue.get_nowait())
     errors = [
-        i
-        for i in items
-        if isinstance(i, server_generation.CorruptedGenerationError)
+        i for i in items if isinstance(i, server_generation.CorruptedGenerationError)
     ]
     assert errors, f"expected CorruptedGenerationError in {items!r}"
     assert items[-1] is None  # stream terminated
@@ -2761,9 +2759,7 @@ def test_chat_completions_client_disconnect_cancels_generation(client, monkeypat
 
     monkeypatch.delenv("MLX_VLM_SOFT_REQUEST_TIMEOUT", raising=False)
     monkeypatch.setattr(server.runtime, "response_generator", FakeResponseGenerator())
-    monkeypatch.setattr(
-        server_openai, "_wait_for_disconnect", fake_wait_for_disconnect
-    )
+    monkeypatch.setattr(server_openai, "_wait_for_disconnect", fake_wait_for_disconnect)
 
     with (
         patch.object(
@@ -3303,6 +3299,7 @@ def test_generation_timings_from_metrics():
     assert timings.predicted_ms == pytest.approx(500.0)
     assert timings.predicted_per_token_ms == pytest.approx(125.0)
     assert timings.predicted_per_second == pytest.approx(8.0)
+    assert timings.cache_reuse_percent == pytest.approx(20.0)
     assert timings.peak_memory == pytest.approx(0.5)
 
     metrics = SimpleNamespace(
@@ -3318,6 +3315,36 @@ def test_generation_timings_from_metrics():
     assert timings.prompt_per_token_ms == 0.0
     assert timings.predicted_ms == 0.0
     assert timings.predicted_per_token_ms == 0.0
+
+
+def test_generation_timings_include_rolling_averages():
+    metrics = SimpleNamespace(
+        cached_tokens=4,
+        prompt_tps=20.0,
+        generation_tps=10.0,
+        token_times=[],
+        peak_memory=0.0,
+    )
+    timings = server.GenerationTimings.from_metrics(
+        metrics,
+        10,
+        5,
+        averages={
+            "requests_completed": 3,
+            "avg_prefill_time_s": 1.25,
+            "avg_prefill_tok_s": 120.0,
+            "avg_generation_time_s": 0.5,
+            "avg_decode_tok_s": 45.0,
+            "avg_kv_cache_reuse_percent": 72.5,
+        },
+    )
+
+    assert timings.averages.requests == 3
+    assert timings.averages.prompt_ms == pytest.approx(1250.0)
+    assert timings.averages.prompt_per_second == pytest.approx(120.0)
+    assert timings.averages.predicted_ms == pytest.approx(500.0)
+    assert timings.averages.predicted_per_second == pytest.approx(45.0)
+    assert timings.averages.cache_reuse_percent == pytest.approx(72.5)
 
 
 def test_generation_metrics_reports_chunk_and_aggregate_rates():
@@ -3336,6 +3363,7 @@ def test_generation_metrics_reports_chunk_and_aggregate_rates():
 
 
 def test_chat_completions_returns_timings(client, monkeypatch):
+    monkeypatch.setattr(server.runtime, "metrics", server.ServerMetricsStore())
     monkeypatch.setattr(server.runtime, "response_generator", None)
     model = SimpleNamespace()
     processor = SimpleNamespace()
@@ -3371,6 +3399,10 @@ def test_chat_completions_returns_timings(client, monkeypatch):
     assert body["usage"]["prompt_tokens_details"]["cached_tokens"] == 2
     assert (body["timings"]["cache_n"], body["timings"]["prompt_n"]) == (2, 8)
     assert body["timings"]["predicted_per_second"] == 8.0
+    assert body["timings"]["cache_reuse_percent"] == pytest.approx(20.0)
+    assert body["timings"]["averages"]["requests"] == 1
+    assert body["timings"]["averages"]["prompt_per_second"] == pytest.approx(16.0)
+    assert body["timings"]["averages"]["predicted_per_second"] == pytest.approx(8.0)
 
 
 def test_chat_completions_streaming_emits_timings_on_finish(client, monkeypatch):
@@ -4332,12 +4364,22 @@ def test_ready_requires_loaded_model_and_live_generation_thread(client, monkeypa
     monkeypatch.setattr(server.runtime, "model_cache", registry)
     monkeypatch.setattr(server.runtime, "response_generator", generator)
     monkeypatch.setattr(server.runtime, "apc_manager", None)
+    metrics = server.ServerMetricsStore()
+    metrics.start_progress("request-1", prompt_tokens=100, max_output_tokens=20)
+    metrics.update_progress(
+        "request-1",
+        prefill_tokens_processed=25,
+        prefill_percent=25.0,
+    )
+    monkeypatch.setattr(server.runtime, "metrics", metrics)
 
     response = client.get("/ready")
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "ready"
     assert set(payload["memory"]) == {"total_gb", "peak_gb", "kv_cache_gb"}
+    assert payload["requests"][0]["request_id"] == "request-1"
+    assert payload["requests"][0]["prefill_percent"] == 25.0
 
     generator.is_alive = lambda: False
     response = client.get("/ready")
@@ -4356,9 +4398,11 @@ def test_metrics_store_logs_request_lifecycle(caplog):
             "stream": True,
             "backend": "continuous_batching",
             "prompt_tokens": 10,
+            "cached_tokens": 6,
             "completion_tokens": 4,
             "generated_tokens": 4,
             "request_elapsed_s": 0.5,
+            "prompt_eval_time_s": 0.04,
             "decode_elapsed_s": 0.1,
             "prefill_tok_s": 100.0,
             "decode_tok_s": 40.0,
@@ -4369,6 +4413,58 @@ def test_metrics_store_logs_request_lifecycle(caplog):
     assert "Request started: endpoint=/chat/completions model=demo" in caplog.text
     assert "Request completed: endpoint=/chat/completions model=demo" in caplog.text
     assert "prefill=100.0 tok/s decode=40.0 tok/s" in caplog.text
+    summary = metrics.snapshot()["summary"]
+    assert summary["avg_prefill_tok_s"] == pytest.approx(100.0)
+    assert summary["avg_decode_tok_s"] == pytest.approx(40.0)
+    assert summary["avg_kv_cache_reuse_percent"] == pytest.approx(60.0)
+
+
+def test_metrics_store_tracks_active_request_progress():
+    metrics = server.ServerMetricsStore()
+
+    metrics.start_progress("abc", prompt_tokens=100, max_output_tokens=25)
+    metrics.update_progress(
+        "abc",
+        prefill_tokens_processed=40,
+        prefill_percent=40.0,
+        cached_tokens=16,
+    )
+
+    progress = metrics.active_progress()
+    assert len(progress) == 1
+    assert progress[0]["request_id"] == "abc"
+    assert progress[0]["phase"] == "prefill"
+    assert progress[0]["prefill_tokens_processed"] == 40
+    assert progress[0]["cached_tokens"] == 16
+
+    metrics.finish_progress("abc")
+    assert metrics.active_progress() == []
+
+
+def test_metrics_store_publishes_progress_for_gateway(tmp_path):
+    progress_path = tmp_path / "request-progress.json"
+    metrics = server.ServerMetricsStore(
+        progress_path=str(progress_path),
+        progress_publish_interval_s=0.01,
+    )
+    metrics.start_progress("abc", prompt_tokens=100, max_output_tokens=25)
+    metrics.update_progress("abc", prefill_percent=50.0)
+
+    deadline = time.monotonic() + 1.0
+    payload = None
+    while time.monotonic() < deadline:
+        try:
+            payload = json.loads(progress_path.read_text())
+        except (FileNotFoundError, json.JSONDecodeError):
+            time.sleep(0.01)
+            continue
+        if payload["requests"]:
+            break
+        time.sleep(0.01)
+
+    assert payload["worker_pid"] == os.getpid()
+    assert payload["requests"][0]["request_id"] == "abc"
+    assert payload["requests"][0]["prefill_percent"] == 50.0
 
 
 def test_metrics_endpoint_records_chat_completion_metrics(client, monkeypatch):
