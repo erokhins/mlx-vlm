@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -17,6 +18,7 @@ from mlx_vlm_shared.server_settings import (
     DEFAULT_CONFIG_PATH,
     config_path,
     load_config,
+    request_progress_path,
 )
 
 from .settings import RESTART_SETTING_KEYS, SettingsStore, SettingsValidationError
@@ -57,6 +59,20 @@ def _proxy_response(response: httpx.Response) -> Response:
         status_code=response.status_code,
         headers=headers,
     )
+
+
+def _worker_request_progress(config_file: Optional[str], worker_pid: int) -> list[dict]:
+    try:
+        with open(request_progress_path(config_file), encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    if payload.get("worker_pid") != worker_pid:
+        return []
+    requests = payload.get("requests")
+    return requests if isinstance(requests, list) else []
 
 
 def create_app(
@@ -150,6 +166,17 @@ def create_app(
                 "error": "error",
             }.get(sup.state, "ready")
         model_id = sup.worker_health.get("loaded_model") or current["model_name"]
+        worker_requests = []
+        if sup.active_requests > 0:
+            worker_requests = sup.worker_health.get("requests") or []
+            if sup.process is not None:
+                worker_requests = (
+                    _worker_request_progress(
+                        settings.config_path,
+                        sup.process.pid,
+                    )
+                    or worker_requests
+                )
         return {
             "phase": phase,
             "phase_detail": (
@@ -168,7 +195,7 @@ def create_app(
                 "in_progress": sup.active_requests > 0,
                 "in_flight": sup.active_requests,
                 "queue_depth": max(0, sup.active_requests - 1),
-                "requests": [],
+                "requests": worker_requests,
             },
         }
 
@@ -490,9 +517,7 @@ def create_app(
                 except (asyncio.CancelledError, httpx.HTTPError):
                     pass
                 sup.requests_cancelled += 1
-                logger.info(
-                    "Client disconnected; aborted in-flight worker request."
-                )
+                logger.info("Client disconnected; aborted in-flight worker request.")
                 # 499: client closed request; nobody reads this.
                 return Response(status_code=499)
             response = post_task.result()
