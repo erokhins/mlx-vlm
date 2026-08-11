@@ -12,6 +12,14 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 
+from mlx_vlm_shared.errors import (
+    MEMORY_PRESSURE_ERROR_CODE,
+    MEMORY_PRESSURE_ERROR_MESSAGE,
+    OUT_OF_MEMORY_ERROR_CODE,
+    OUT_OF_MEMORY_ERROR_MESSAGE,
+    WORKER_CRASHED_ERROR_CODE,
+    WORKER_CRASHED_ERROR_MESSAGE,
+)
 from mlx_vlm_shared.server_settings import (
     CONFIG_PATH_ENV,
     DEFAULT_CONFIG_PATH,
@@ -19,6 +27,17 @@ from mlx_vlm_shared.server_settings import (
     load_config,
 )
 
+from .crash_diagnostics import (
+    capture_log_position,
+    fresh_log_has_out_of_memory,
+    latest_memory_was_critical,
+)
+from .memory_monitor import (
+    MEMORY_SAMPLE_INTERVAL_S,
+    MemorySample,
+    RecentMemorySamples,
+    read_memory_sample,
+)
 from .settings import RESTART_SETTING_KEYS, SettingsStore, SettingsValidationError
 from .supervisor import GatewaySettings, WorkerSupervisor, worker_command
 
@@ -59,11 +78,53 @@ def _proxy_response(response: httpx.Response) -> Response:
     )
 
 
+def _is_confirmed_out_of_memory(response: httpx.Response) -> bool:
+    if response.status_code != 503:
+        return False
+    try:
+        payload = response.json()
+    except ValueError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == OUT_OF_MEMORY_ERROR_CODE
+    )
+
+
+def _server_error_response(code: str, message: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": message,
+                "type": "server_error",
+                "code": code,
+            }
+        },
+    )
+
+
 def create_app(
     settings: GatewaySettings,
     client_factory: Optional[Callable[[httpx.Timeout], httpx.AsyncClient]] = None,
     shutdown_callback: Optional[Callable[[], None]] = None,
+    memory_sampler: Optional[Callable[[Optional[int]], MemorySample]] = None,
 ) -> FastAPI:
+    sample_memory = memory_sampler or read_memory_sample
+
+    async def record_recent_memory(app: FastAPI) -> None:
+        while True:
+            sup = app.state.supervisor
+            process = sup.process
+            worker_pid = (
+                process.pid
+                if process is not None and process.returncode is None
+                else None
+            )
+            app.state.memory_samples.append(sample_memory(worker_pid))
+            await asyncio.sleep(MEMORY_SAMPLE_INTERVAL_S)
+
     async def stop_idle_worker(app: FastAPI) -> None:
         while True:
             await asyncio.sleep(settings.idle_check_interval_s)
@@ -113,17 +174,27 @@ def create_app(
         app.state.lifecycle_lock = asyncio.Lock()
         app.state.shutting_down = False
         app.state.models_payload = None
+        app.state.memory_samples = RecentMemorySamples()
         await supervisor.open()
         idle_task = asyncio.create_task(
             stop_idle_worker(app),
             name="mlx-vlm-idle-worker-stop",
         )
+        memory_task = asyncio.create_task(
+            record_recent_memory(app),
+            name="mlx-vlm-memory-sampler",
+        )
         try:
             yield
         finally:
             idle_task.cancel()
+            memory_task.cancel()
             try:
                 await idle_task
+            except asyncio.CancelledError:
+                pass
+            try:
+                await memory_task
             except asyncio.CancelledError:
                 pass
             await supervisor.close()
@@ -464,6 +535,8 @@ def create_app(
                     ),
                 ) from exc
             worker_generation = sup.generation
+            worker_process = sup.process
+            request_log_position = capture_log_position(settings.worker_log_path)
 
             post_task = asyncio.create_task(
                 request.app.state.client.post(
@@ -507,10 +580,56 @@ def create_app(
             ) from exc
         except httpx.RequestError as exc:
             sup.requests_failed += 1
+            worker_pid = None if worker_process is None else worker_process.pid
+            returncode = (
+                None if worker_process is None else worker_process.returncode
+            )
+            if worker_process is not None and returncode is None:
+                try:
+                    returncode = await asyncio.wait_for(
+                        worker_process.wait(), timeout=0.05
+                    )
+                except asyncio.TimeoutError:
+                    returncode = worker_process.returncode
+            confirmed_oom = fresh_log_has_out_of_memory(
+                settings.worker_log_path, request_log_position
+            )
+            killed_under_memory_pressure = (
+                returncode == -9
+                and latest_memory_was_critical(
+                    request.app.state.memory_samples.snapshot(), worker_pid
+                )
+            )
+            worker_crashed = returncode is not None and returncode != 0
+            if confirmed_oom:
+                restart_reason = (
+                    "worker log reported confirmed out-of-memory error after "
+                    "connection failure"
+                )
+            elif killed_under_memory_pressure:
+                restart_reason = "worker was killed under critical memory pressure"
+            elif worker_crashed:
+                restart_reason = (
+                    f"worker crashed during inference with exit code {returncode}"
+                )
+            else:
+                restart_reason = f"worker connection failed during inference: {exc}"
             sup.schedule_restart(
-                f"worker connection failed during inference: {exc}",
+                restart_reason,
                 generation=worker_generation,
             )
+            if confirmed_oom:
+                return _server_error_response(
+                    OUT_OF_MEMORY_ERROR_CODE, OUT_OF_MEMORY_ERROR_MESSAGE
+                )
+            if killed_under_memory_pressure:
+                return _server_error_response(
+                    MEMORY_PRESSURE_ERROR_CODE, MEMORY_PRESSURE_ERROR_MESSAGE
+                )
+            if worker_crashed:
+                return _server_error_response(
+                    WORKER_CRASHED_ERROR_CODE, WORKER_CRASHED_ERROR_MESSAGE
+                )
             raise HTTPException(
                 status_code=503,
                 detail="Inference worker restarted; please retry",
@@ -519,6 +638,13 @@ def create_app(
             sup.active_requests = max(0, sup.active_requests - 1)
             sup.last_activity_at = time.monotonic()
 
+        if _is_confirmed_out_of_memory(response):
+            sup.requests_failed += 1
+            sup.schedule_restart(
+                "worker reported confirmed out-of-memory error",
+                generation=worker_generation,
+            )
+            return _proxy_response(response)
         if response.status_code == 508:
             # The worker's private corrupted-generation signal (token-id-0
             # loop): restart it immediately and tell the client to retry —

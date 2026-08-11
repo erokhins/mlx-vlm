@@ -18,7 +18,13 @@ from typing import Any, List, Optional, Tuple
 
 import mlx.core as mx
 from fastapi import HTTPException, Request, Response
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from mlx_vlm_shared.errors import (
+    OUT_OF_MEMORY_ERROR_CODE,
+    OUT_OF_MEMORY_ERROR_MESSAGE,
+    is_out_of_memory_error,
+)
 
 from ..generate import generate, stream_generate
 from ..generate.edit_image import ImageEditRequest as CoreImageEditRequest
@@ -87,7 +93,30 @@ from .schemas import (
     UsageStats,
 )
 
+
 logger = logging.getLogger("mlx_vlm.server")
+
+
+def _out_of_memory_response(
+    error: BaseException, *, model: str, stream: bool
+) -> JSONResponse:
+    runtime.metrics.record_failure(
+        endpoint="/chat/completions",
+        model=model,
+        stream=stream,
+        error=f"out_of_memory: {error}",
+    )
+    logger.exception("Chat completion ran out of memory: %s", error)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "error": {
+                "message": OUT_OF_MEMORY_ERROR_MESSAGE,
+                "type": "server_error",
+                "code": OUT_OF_MEMORY_ERROR_CODE,
+            }
+        },
+    )
 
 
 def _get_soft_request_timeout() -> Optional[float]:
@@ -2492,6 +2521,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     ),
                 )
             except Exception as e:
+                if is_out_of_memory_error(e):
+                    return _out_of_memory_response(
+                        e, model=request.model, stream=False
+                    )
                 runtime.metrics.record_failure(
                     endpoint="/chat/completions",
                     model=request.model,
@@ -2507,6 +2540,10 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
         # Re-raise HTTP exceptions (like model loading failure)
         raise http_exc
     except Exception as e:
+        if is_out_of_memory_error(e):
+            return _out_of_memory_response(
+                e, model=request.model, stream=bool(request.stream)
+            )
         # Catch unexpected errors
         logger.exception("Unexpected error in /chat/completions endpoint: %s", e)
         mx.clear_cache()
