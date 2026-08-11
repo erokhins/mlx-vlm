@@ -1,4 +1,5 @@
 import gc
+import json
 import logging
 import os
 import time
@@ -185,6 +186,7 @@ def _run_chunked_speculative_prefill(
     *,
     prefill_step_size: Optional[int],
     generation_stream,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
 ) -> Tuple[object, mx.array]:
     """Prefill target cache in chunks, capturing speculative state only at end."""
     remaining_input_ids = input_ids
@@ -195,6 +197,8 @@ def _run_chunked_speculative_prefill(
         batch_size=input_ids.shape[0],
         sequence_length=inputs_embeds.shape[1],
     )
+    total_columns = int(inputs_embeds.shape[1])
+    processed_columns = 0
 
     if (
         prefill_step_size is not None
@@ -215,6 +219,9 @@ def _run_chunked_speculative_prefill(
                     **chunk_kwargs,
                 )
             mx.eval([c.state for c in prompt_cache])
+            processed_columns += n_to_process
+            if progress_callback is not None:
+                progress_callback(processed_columns, total_columns)
             remaining_input_ids = remaining_input_ids[:, n_to_process:]
             remaining_embeds = remaining_embeds[:, n_to_process:]
             remaining_kwargs = _drop_prefill_kwargs(
@@ -451,9 +458,25 @@ def _token_window_rate_first(token_times: List[float], window: int) -> Optional[
 class ServerMetricsStore:
     """Rolling request metrics and lifetime counters for the server."""
 
-    def __init__(self, history_limit: int = METRICS_HISTORY_LIMIT):
+    def __init__(
+        self,
+        history_limit: int = METRICS_HISTORY_LIMIT,
+        *,
+        progress_path: Optional[str] = None,
+        progress_publish_interval_s: float = 0.5,
+    ):
         self.history_limit = history_limit
+        self._progress_path = progress_path
+        self._progress_publish_interval_s = progress_publish_interval_s
+        self._progress_changed = Event()
         self.reset()
+        if self._progress_path:
+            Thread(
+                target=self._publish_progress_loop,
+                name="mlx-vlm-progress-publisher",
+                daemon=True,
+            ).start()
+            self._progress_changed.set()
 
     def reset(self):
         self.started_at = time.time()
@@ -466,12 +489,16 @@ class ServerMetricsStore:
         self._streaming_requests = 0
         self._in_flight = 0
         self._prompt_tokens_total = 0
+        self._cached_tokens_total = 0
+        self._prefill_tokens_total = 0
         self._completion_tokens_total = 0
         self._generated_tokens_total = 0
         self._request_time_total_s = 0.0
+        self._prefill_time_total_s = 0.0
         self._decode_time_total_s = 0.0
         self._last_request_at: Optional[float] = None
         self._last_error: Optional[dict] = None
+        self._active_progress: dict[str, dict] = {}
 
     def begin_request(self, *, endpoint: str, model: str, stream: bool):
         with self._lock:
@@ -496,11 +523,22 @@ class ServerMetricsStore:
             self._latest = payload
             self._recent.append(payload)
             self._last_request_at = payload.get("timestamp_unix")
-            self._prompt_tokens_total += int(payload.get("prompt_tokens") or 0)
+            prompt_tokens = int(payload.get("prompt_tokens") or 0)
+            cached_tokens = int(payload.get("cached_tokens") or 0)
+            self._prompt_tokens_total += prompt_tokens
+            self._cached_tokens_total += cached_tokens
+            self._prefill_tokens_total += max(0, prompt_tokens - cached_tokens)
             self._completion_tokens_total += int(payload.get("completion_tokens") or 0)
             self._generated_tokens_total += int(payload.get("generated_tokens") or 0)
             self._request_time_total_s += float(payload.get("request_elapsed_s") or 0.0)
-            self._decode_time_total_s += float(payload.get("decode_elapsed_s") or 0.0)
+            self._prefill_time_total_s += float(
+                payload.get("prompt_eval_time_s") or 0.0
+            )
+            self._decode_time_total_s += float(
+                payload.get("generation_eval_time_s")
+                or payload.get("decode_elapsed_s")
+                or 0.0
+            )
             in_flight = self._in_flight
         logger.info(
             "Request completed: endpoint=%s model=%s stream=%s backend=%s "
@@ -518,6 +556,70 @@ class ServerMetricsStore:
             payload.get("finish_reason"),
             in_flight,
         )
+
+    def start_progress(
+        self,
+        request_id: str,
+        *,
+        prompt_tokens: int,
+        max_output_tokens: int,
+    ) -> None:
+        now = time.time()
+        with self._lock:
+            self._active_progress[str(request_id)] = {
+                "request_id": str(request_id),
+                "phase": "prefill",
+                "prompt_tokens": max(0, int(prompt_tokens)),
+                "prefill_tokens_processed": 0,
+                "prefill_percent": 0.0,
+                "cached_tokens": 0,
+                "generated_tokens": 0,
+                "max_output_tokens": max(0, int(max_output_tokens)),
+                "started_at_unix": now,
+                "updated_at_unix": now,
+            }
+        self._progress_changed.set()
+
+    def update_progress(self, request_id: str, **changes) -> None:
+        with self._lock:
+            progress = self._active_progress.get(str(request_id))
+            if progress is None:
+                return
+            progress.update(changes)
+            progress["updated_at_unix"] = time.time()
+        self._progress_changed.set()
+
+    def finish_progress(self, request_id: str) -> None:
+        with self._lock:
+            self._active_progress.pop(str(request_id), None)
+        self._progress_changed.set()
+
+    def active_progress(self) -> list[dict]:
+        with self._lock:
+            return [dict(item) for item in self._active_progress.values()]
+
+    def _publish_progress_loop(self) -> None:
+        while True:
+            self._progress_changed.wait()
+            self._progress_changed.clear()
+            time.sleep(self._progress_publish_interval_s)
+            payload = {
+                "worker_pid": os.getpid(),
+                "updated_at_unix": time.time(),
+                "requests": self.active_progress(),
+            }
+            temporary_path = f"{self._progress_path}.tmp.{os.getpid()}"
+            try:
+                os.makedirs(os.path.dirname(self._progress_path), exist_ok=True)
+                with open(temporary_path, "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream, separators=(",", ":"))
+                os.replace(temporary_path, self._progress_path)
+            except OSError as exc:
+                logger.warning("Failed to publish request progress: %s", exc)
+                try:
+                    os.unlink(temporary_path)
+                except OSError:
+                    pass
 
     def record_failure(self, *, endpoint: str, model: str, stream: bool, error: str):
         with self._lock:
@@ -561,6 +663,26 @@ class ServerMetricsStore:
                 if self._decode_time_total_s > 0
                 else 0.0
             )
+            avg_prefill_tok_s = (
+                self._prefill_tokens_total / self._prefill_time_total_s
+                if self._prefill_time_total_s > 0
+                else 0.0
+            )
+            avg_prefill_time = (
+                self._prefill_time_total_s / requests_completed
+                if requests_completed > 0
+                else 0.0
+            )
+            avg_generation_time = (
+                self._decode_time_total_s / requests_completed
+                if requests_completed > 0
+                else 0.0
+            )
+            avg_cache_reuse = (
+                100.0 * self._cached_tokens_total / self._prompt_tokens_total
+                if self._prompt_tokens_total > 0
+                else 0.0
+            )
             last_error = (
                 dict(self._last_error) if self._last_error is not None else None
             )
@@ -576,11 +698,17 @@ class ServerMetricsStore:
                     "streaming_requests": self._streaming_requests,
                     "in_flight": self._in_flight,
                     "prompt_tokens_total": self._prompt_tokens_total,
+                    "cached_tokens_total": self._cached_tokens_total,
+                    "prefill_tokens_total": self._prefill_tokens_total,
                     "completion_tokens_total": self._completion_tokens_total,
                     "generated_tokens_total": self._generated_tokens_total,
                     "avg_request_time_s": avg_request_time,
                     "avg_request_tok_s": avg_request_tok_s,
+                    "avg_prefill_time_s": avg_prefill_time,
+                    "avg_prefill_tok_s": avg_prefill_tok_s,
+                    "avg_generation_time_s": avg_generation_time,
                     "avg_decode_tok_s": avg_decode_tok_s,
+                    "avg_kv_cache_reuse_percent": avg_cache_reuse,
                     "last_request_at": last_request_at,
                     "last_error": last_error,
                 },
@@ -623,6 +751,7 @@ def _build_metrics_envelope(
     token_times: Optional[List[float]] = None,
     prompt_tps: Optional[float] = None,
     generation_tps: Optional[float] = None,
+    cached_tokens: int = 0,
     peak_memory_gb: Optional[float] = None,
     finish_reason: Optional[str] = None,
     image_count: int = 0,
@@ -643,6 +772,12 @@ def _build_metrics_envelope(
     elif decode_elapsed_s is not None and decode_elapsed_s > 0 and generated_tokens > 0:
         decode_tok_s = generated_tokens / decode_elapsed_s
     prompt_eval_time_s = _prompt_eval_time_from_tps(prompt_tokens, prompt_tps)
+    cached_tokens = max(0, min(int(cached_tokens), int(prompt_tokens)))
+    generation_eval_time_s = (
+        generated_tokens / decode_tok_s
+        if decode_tok_s is not None and decode_tok_s > 0 and generated_tokens > 0
+        else 0.0
+    )
     request_tok_s = (
         completion_tokens / request_elapsed_s if request_elapsed_s > 0 else 0.0
     )
@@ -653,6 +788,11 @@ def _build_metrics_envelope(
         "stream": bool(stream),
         "backend": backend,
         "prompt_tokens": int(prompt_tokens),
+        "cached_tokens": cached_tokens,
+        "prefill_tokens": max(0, int(prompt_tokens) - cached_tokens),
+        "kv_cache_reuse_percent": (
+            100.0 * cached_tokens / int(prompt_tokens) if prompt_tokens else 0.0
+        ),
         "completion_tokens": int(completion_tokens),
         "generated_tokens": int(generated_tokens),
         "reasoning_tokens": max(0, int(generated_tokens) - int(completion_tokens)),
@@ -661,6 +801,7 @@ def _build_metrics_envelope(
         "prefill_tok_s": prompt_tps,
         "ttft_s": ttft_s,
         "decode_elapsed_s": decode_elapsed_s,
+        "generation_eval_time_s": generation_eval_time_s,
         "request_elapsed_s": request_elapsed_s,
         "request_tok_s": request_tok_s,
         "decode_tok_s": decode_tok_s,
@@ -1356,6 +1497,33 @@ class ResponseGenerator:
             request.request_id = f"{id(request.rqueue):x}"
         return request.request_id
 
+    @staticmethod
+    def _start_request_progress(request_id: str, request: QueuedGenerationRequest):
+        store = runtime.metrics
+        if store is not None and hasattr(store, "start_progress"):
+            store.start_progress(
+                request_id,
+                prompt_tokens=request.prompt_tokens,
+                max_output_tokens=request.args.max_tokens or 0,
+            )
+
+    @staticmethod
+    def _update_request_progress(request_id: str, **changes):
+        store = runtime.metrics
+        if store is not None and hasattr(store, "update_progress"):
+            store.update_progress(request_id, **changes)
+
+    @staticmethod
+    def _finish_request_progress(info: dict):
+        store = runtime.metrics
+        request_id = info.get("request_id")
+        if (
+            request_id is not None
+            and store is not None
+            and hasattr(store, "finish_progress")
+        ):
+            store.finish_progress(request_id)
+
     def _log_prefill_started(
         self, request: QueuedGenerationRequest, *, backend: str
     ) -> dict:
@@ -1371,6 +1539,7 @@ class ResponseGenerator:
             len(request.audio or []),
             len(request.videos or []),
         )
+        self._start_request_progress(request_id, request)
         return {
             "request_id": request_id,
             "queued_at": request.queued_at,
@@ -1421,6 +1590,14 @@ class ResponseGenerator:
                 continue
             info["prefill_processed"] = processed
             percent = 100.0 * processed / total if total > 0 else 100.0
+            self._update_request_progress(
+                info.get("request_id", str(uid)),
+                phase="prefill",
+                prompt_tokens=total,
+                prefill_tokens_processed=processed,
+                prefill_percent=round(percent, 1),
+                cached_tokens=cached,
+            )
             logger.info(
                 "Prefill progress: request=%s tokens=%d/%d (%.1f%%)",
                 info.get("request_id", uid),
@@ -1438,6 +1615,15 @@ class ResponseGenerator:
         if prompt_time <= 0 and prompt_tps > 0:
             prompt_time = prompt_tokens / prompt_tps
         info["prefill_processed"] = prompt_tokens
+        info["cached_tokens"] = cached_tokens
+        ResponseGenerator._update_request_progress(
+            info.get("request_id", str(uid)),
+            phase="generation",
+            prompt_tokens=prompt_tokens,
+            prefill_tokens_processed=prompt_tokens,
+            prefill_percent=100.0,
+            cached_tokens=cached_tokens,
+        )
         logger.info(
             "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
             "elapsed=%.3fs rate=%.1f tok/s",
@@ -1464,6 +1650,11 @@ class ResponseGenerator:
         generated_tokens = previous_tokens + emitted_tokens
         info["generated_tokens"] = generated_tokens
         request_id = info.get("request_id", uid)
+        ResponseGenerator._update_request_progress(
+            str(request_id),
+            phase="generation",
+            generated_tokens=generated_tokens,
+        )
 
         previous_token_at = info.get("last_token_at")
         token_rate = None
@@ -1521,8 +1712,7 @@ class ResponseGenerator:
             )
         elif crossed_interval and not debug_enabled:
             logger.info(
-                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs "
-                "rate=%s",
+                "Decode progress: request=%s generated_tokens=%d elapsed=%.3fs rate=%s",
                 request_id,
                 generated_tokens,
                 elapsed,
@@ -1925,6 +2115,7 @@ class ResponseGenerator:
                                 info.get("request_id", uid),
                                 int(info.get("generated_tokens", 0) or 0),
                             )
+                            self._finish_request_progress(info)
                             try:
                                 info["rqueue"].put(None)
                             except Exception:
@@ -2002,6 +2193,7 @@ class ResponseGenerator:
                             thinking_budget_criteria=[thinking_budget_criteria],
                         )
                     except Exception as e:
+                        self._finish_request_progress(log_state)
                         rqueue.put(e)
                         continue
 
@@ -2026,6 +2218,7 @@ class ResponseGenerator:
             except Exception as e:
                 logger.exception("Error in generation thread")
                 for info in list(active.values()):
+                    self._finish_request_progress(info)
                     try:
                         info["rqueue"].put(e)
                         info["rqueue"].put(None)
@@ -2038,6 +2231,8 @@ class ResponseGenerator:
 
         if batch_gen is not None and callable(getattr(batch_gen, "close", None)):
             batch_gen.close()
+        for info in list(active.values()):
+            self._finish_request_progress(info)
 
     def _run_diffusion(self):
         """GPU thread loop for diffusion models.
@@ -2076,6 +2271,8 @@ class ResponseGenerator:
                             rqueue.put(None)
                         except Exception:
                             pass
+                    finally:
+                        self._finish_request_progress(log_state)
                     mx.clear_cache()
             except Exception:
                 logger.exception("Error in diffusion generation thread")
@@ -2122,12 +2319,21 @@ class ResponseGenerator:
             if not prefill_logged and getattr(result, "prompt_tps", None) is not None:
                 prompt_tps = float(result.prompt_tps or 0.0)
                 prompt_tokens = int(getattr(result, "prompt_tokens", 0) or 0)
+                cached_tokens = int(getattr(result, "cached_tokens", 0) or 0)
+                self._update_request_progress(
+                    log_state.get("request_id", str(uid)),
+                    phase="generation",
+                    prompt_tokens=prompt_tokens,
+                    prefill_tokens_processed=prompt_tokens,
+                    prefill_percent=100.0,
+                    cached_tokens=cached_tokens,
+                )
                 logger.info(
                     "Prefill completed: request=%s prompt_tokens=%d cached_tokens=%d "
                     "elapsed=%.3fs rate=%.1f tok/s",
                     log_state.get("request_id", uid),
                     prompt_tokens,
-                    int(getattr(result, "cached_tokens", 0) or 0),
+                    cached_tokens,
                     prompt_tokens / prompt_tps if prompt_tps > 0 else 0.0,
                     prompt_tps,
                 )
@@ -2191,6 +2397,7 @@ class ResponseGenerator:
         while not self._stop:
             pending = []
             rqueues = {}
+            stream_infos = {}
             try:
                 # --- Phase 1: collect pending requests ---
                 pending, should_stop = self._collect_pending_requests(
@@ -2206,7 +2413,6 @@ class ResponseGenerator:
                 uids = []
                 rqueues = {}
                 token_lists = {}
-                stream_infos = {}
                 max_tokens_map = {}
                 prompt_tokens_map = {}
                 prompt_tps_map = {}
@@ -2280,6 +2486,27 @@ class ResponseGenerator:
                     prefill_step_size = None
 
                 prompt_started = time.perf_counter()
+
+                def report_prefill_progress(processed_columns, _total_columns):
+                    for index, uid in enumerate(uids):
+                        prompt_tokens = prompt_tokens_map[uid]
+                        processed = min(
+                            prompt_tokens,
+                            max(0, int(processed_columns) - left_padding[index]),
+                        )
+                        percent = (
+                            100.0 * processed / prompt_tokens
+                            if prompt_tokens > 0
+                            else 100.0
+                        )
+                        self._update_request_progress(
+                            stream_infos[uid].get("request_id", str(uid)),
+                            phase="prefill",
+                            prompt_tokens=prompt_tokens,
+                            prefill_tokens_processed=processed,
+                            prefill_percent=round(percent, 1),
+                        )
+
                 out, input_mx = _run_chunked_speculative_prefill(
                     lm,
                     input_mx,
@@ -2289,6 +2516,7 @@ class ResponseGenerator:
                     prefill_kwargs,
                     prefill_step_size=prefill_step_size,
                     generation_stream=generation_stream,
+                    progress_callback=report_prefill_progress,
                 )
                 hidden = speculative_hidden_state(draft_kind, out)
                 shared_kv_states = out.shared_kv_states if is_mtp else None
@@ -2315,6 +2543,14 @@ class ResponseGenerator:
                         prompt_tokens,
                         prompt_elapsed,
                         float(prompt_tps_map[uid] or 0.0),
+                    )
+                    self._update_request_progress(
+                        stream_infos[uid].get("request_id", str(uid)),
+                        phase="generation",
+                        prompt_tokens=prompt_tokens,
+                        prefill_tokens_processed=prompt_tokens,
+                        prefill_percent=100.0,
+                        cached_tokens=0,
                     )
 
                 finished_uids = set()
@@ -2348,6 +2584,7 @@ class ResponseGenerator:
                     )
                     if finish is not None:
                         rqueues[uid].put(None)
+                        self._finish_request_progress(stream_infos[uid])
                         finished_uids.add(uid)
 
                 if len(finished_uids) == len(uids):
@@ -2391,6 +2628,7 @@ class ResponseGenerator:
                     for uid in cancelled:
                         if uid in rqueues and uid not in finished_uids:
                             rqueues[uid].put(None)
+                            self._finish_request_progress(stream_infos[uid])
                             finished_uids.add(uid)
                         self._acknowledge_cancel(uid)
                     for j, tok in enumerate(tok_list):
@@ -2430,6 +2668,7 @@ class ResponseGenerator:
 
                         if finish is not None:
                             rqueues[uid].put(None)
+                            self._finish_request_progress(stream_infos[uid])
                             finished_uids.add(uid)
                     if len(finished_uids) == len(uids):
                         break
@@ -2473,9 +2712,12 @@ class ResponseGenerator:
                             )
                         )
                         rqueues[uid].put(None)
+                        self._finish_request_progress(stream_infos[uid])
 
             except Exception as e:
                 logger.exception("Error in speculative generation thread: %s", e)
+                for info in stream_infos.values():
+                    self._finish_request_progress(info)
                 error_queues = {id(rqueue): rqueue for rqueue in rqueues.values()}
                 error_queues.update(
                     {id(request.rqueue): request.rqueue for request in pending}
@@ -2544,6 +2786,7 @@ class ResponseGenerator:
                     rqueue.put(CorruptedGenerationError(reason))
                     rqueue.put(None)
                     batch_gen.remove(r.uid)
+                    self._finish_request_progress(info)
                     del active[r.uid]
                     continue
 
@@ -2572,15 +2815,14 @@ class ResponseGenerator:
                     token_count=token_count,
                     emitted_at=emitted_at,
                     spec_stats=(
-                        self._speculative_stats_snapshot()
-                        if r.finish_reason
-                        else None
+                        self._speculative_stats_snapshot() if r.finish_reason else None
                     ),
                 )
             )
 
             if r.finish_reason is not None:
                 rqueue.put(None)
+                self._finish_request_progress(info)
                 del active[r.uid]
                 self._log_speculative_stats(info.get("request_id", r.uid))
                 if self._raw_token_log:

@@ -16,6 +16,7 @@ logger = logging.getLogger("mlx_vlm.config")
 
 CONFIG_PATH_ENV = "JUNIE_SERVER_CONFIG"
 DEFAULT_CONFIG_PATH = "~/.local/share/junie-local/server-config.json"
+REQUEST_PROGRESS_SUFFIX = ".progress"
 
 PUBLIC_SETTING_KEYS = (
     "model_name",
@@ -206,6 +207,11 @@ def config_path() -> str:
     # Absolute, so the daemon and the worker it spawns agree on the file and
     # on the APC cache directory derived from the directory holding it.
     return os.path.abspath(os.path.expanduser(raw))
+
+
+def request_progress_path(path: Optional[str] = None) -> str:
+    """Runtime request progress shared by the worker and gateway."""
+    return f"{path or config_path()}{REQUEST_PROGRESS_SUFFIX}"
 
 
 def load_config(path: Optional[str] = None) -> dict:

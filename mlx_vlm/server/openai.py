@@ -116,6 +116,7 @@ async def _wait_for_disconnect(request: Request) -> None:
         if message["type"] == "http.disconnect":
             return
 
+
 _INHERIT_ADAPTER = None
 get_cached_model = None
 _build_gen_args = None
@@ -2399,17 +2400,6 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                         logprobs=response_logprobs,
                     )
                 ]
-                result = ChatResponse(
-                    id=f"chatcmpl-{uuid.uuid4()}",
-                    created=int(time.time()),
-                    model=request.model,
-                    usage=usage_stats,
-                    choices=choices,
-                    timings=GenerationTimings.from_metrics(
-                        metrics, prompt_tokens, output_tokens
-                    ),
-                )
-
                 elapsed = time.perf_counter() - request_start
                 logger.debug(
                     "chat/completions done: prompt_tokens=%d completion_tokens=%d "
@@ -2442,7 +2432,8 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     request_started_s=request_start,
                     token_times=metrics.token_times,
                     prompt_tps=metrics.prompt_tps,
-                    generation_tps=metrics.generation_tps,
+                    generation_tps=metrics.rate or metrics.generation_tps,
+                    cached_tokens=metrics.cached_tokens,
                     peak_memory_gb=metrics.peak_memory or None,
                     finish_reason=(
                         "tool_calls" if parsed_tool_calls else finish_reason or "stop"
@@ -2455,6 +2446,20 @@ async def chat_completions_endpoint(request: ChatRequest, http_request: Request)
                     tool_calls=bool(parsed_tool_calls),
                 )
                 runtime.metrics.record_success(envelope)
+
+                result = ChatResponse(
+                    id=f"chatcmpl-{uuid.uuid4()}",
+                    created=int(time.time()),
+                    model=request.model,
+                    usage=usage_stats,
+                    choices=choices,
+                    timings=GenerationTimings.from_metrics(
+                        metrics,
+                        prompt_tokens,
+                        output_tokens,
+                        averages=runtime.metrics.snapshot()["summary"],
+                    ),
+                )
 
                 return result
 

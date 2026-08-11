@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from starlette.datastructures import MutableHeaders
 from huggingface_hub import scan_cache_dir
 from huggingface_hub.errors import CacheNotFound, RepositoryNotFoundError
+from mlx_vlm_shared.server_settings import CONFIG_PATH_ENV, request_progress_path
 
 from .. import apc as _apc
 from ..generate.edit_image import load_image_edit_model
@@ -303,7 +304,10 @@ def _make_logprob_content(
 
 
 # Shared mutable server runtime state.
-runtime.metrics = ServerMetricsStore()
+_config_path = os.environ.get(CONFIG_PATH_ENV)
+runtime.metrics = ServerMetricsStore(
+    progress_path=request_progress_path(_config_path) if _config_path else None
+)
 
 
 def _server_package_attr(name, fallback=None):
@@ -975,6 +979,7 @@ async def readiness_check(request: Request):
             "loaded_model": snapshot["loaded_model"],
             "generation_thread_alive": snapshot["generation_thread_alive"],
             "memory": memory_stats(),
+            "requests": runtime.metrics.active_progress(),
         },
         status_code=200 if ready else 503,
     )

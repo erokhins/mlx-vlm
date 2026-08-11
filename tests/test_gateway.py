@@ -299,6 +299,57 @@ def test_status_reports_worker_memory_from_ready_probe(monkeypatch, tmp_path):
         assert client.get("/status").json()["memory"] == memory
 
 
+def test_status_reports_current_worker_request_progress(monkeypatch, tmp_path):
+    config_path = tmp_path / "server-config.json"
+    config_path.write_text(json.dumps({"model_name": "demo-model"}))
+    requests = [
+        {
+            "request_id": "abc",
+            "phase": "prefill",
+            "prompt_tokens": 1000,
+            "prefill_tokens_processed": 640,
+            "prefill_percent": 64.0,
+            "cached_tokens": 128,
+            "generated_tokens": 0,
+            "max_output_tokens": 200,
+        }
+    ]
+
+    def handler(request):
+        if request.url.path == "/ready":
+            return httpx.Response(
+                200,
+                json={
+                    "status": "ready",
+                    "loaded_model": "demo-model",
+                },
+            )
+        raise AssertionError(request.url.path)
+
+    app, _ = _gateway(monkeypatch, handler, config_path=str(config_path))
+    with TestClient(app) as client:
+        _wait_until(lambda: client.get("/status").json()["phase"] == "ready")
+        supervisor = app.state.supervisor
+        progress_path = tmp_path / "server-config.json.progress"
+        progress_path.write_text(
+            json.dumps(
+                {
+                    "worker_pid": supervisor.process.pid,
+                    "requests": requests,
+                }
+            )
+        )
+        supervisor.active_requests = 1
+        inference = client.get("/status").json()["inference"]
+        supervisor.active_requests = 0
+        idle_inference = client.get("/status").json()["inference"]
+
+    assert inference["in_progress"] is True
+    assert inference["requests"] == requests
+    assert idle_inference["in_progress"] is False
+    assert idle_inference["requests"] == []
+
+
 def test_apply_auto_unload_time_without_restarting_worker(monkeypatch, tmp_path):
     config_path = tmp_path / "server-config.json"
     config_path.write_text(
@@ -587,9 +638,7 @@ def test_worker_508_returns_503_and_restarts_worker(monkeypatch):
         if request.url.path == "/ready":
             return httpx.Response(200, json={"status": "ready"})
         if request.url.path == "/v1/chat/completions":
-            return httpx.Response(
-                508, json={"detail": "corrupted generation"}
-            )
+            return httpx.Response(508, json={"detail": "corrupted generation"})
         raise AssertionError(request.url.path)
 
     app, processes = _gateway(monkeypatch, handler)
@@ -626,6 +675,7 @@ def test_client_disconnect_aborts_worker_request(monkeypatch):
     async def run():
         async with app.router.lifespan_context(app):
             sup = app.state.supervisor
+
             async def until_ready():
                 while sup.state != "ready":
                     await asyncio.sleep(0.01)
@@ -693,9 +743,7 @@ def test_old_worker_responses_do_not_affect_new_worker(monkeypatch):
 
         def record_500(generation):
             return client.portal.call(
-                lambda: supervisor.record_worker_response(
-                    500, generation=generation
-                )
+                lambda: supervisor.record_worker_response(500, generation=generation)
             )
 
         _wait_until(lambda: supervisor.state == "ready")
@@ -746,9 +794,7 @@ def test_repeated_start_failures_stop_restart_loop(monkeypatch):
         time.sleep(0.08)
         assert len(processes) == process_count
 
-        response = client.post(
-            "/apply_settings", json={"max_context_length": 12345}
-        )
+        response = client.post("/apply_settings", json={"max_context_length": 12345})
         assert response.status_code == 200
         assert response.json()["status"] == "applying"
         _wait_until(lambda: len(processes) == process_count + 1)
@@ -947,9 +993,7 @@ def test_unload_interrupts_request_waiting_for_worker_startup(monkeypatch):
         startup_timeout_s=1.0,
     )
     with TestClient(app) as client:
-        _wait_until(
-            lambda: client.get("/status").json()["phase"] == "loading_model"
-        )
+        _wait_until(lambda: client.get("/status").json()["phase"] == "loading_model")
         result = {}
 
         def send_request():
@@ -987,8 +1031,10 @@ def test_unload_during_restart_delay_prevents_worker_respawn(monkeypatch):
 
         client.portal.call(app.state.supervisor.schedule_restart, "test restart")
         _wait_until(
-            lambda: app.state.supervisor.state == "restarting"
-            and app.state.supervisor.process is None
+            lambda: (
+                app.state.supervisor.state == "restarting"
+                and app.state.supervisor.process is None
+            )
         )
 
         response = client.post("/unload")
