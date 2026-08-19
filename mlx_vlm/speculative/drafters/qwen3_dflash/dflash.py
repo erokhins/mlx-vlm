@@ -117,7 +117,114 @@ class DFlashDecoderLayer(nn.Module):
         return h + self.mlp(self.post_attention_layernorm(h))
 
 
+def _grouped_dynamic_convolve(hidden, dynamic, base, group_size):
+    batch, length, hidden_size = hidden.shape
+    groups = hidden_size // group_size
+    blocks = hidden.reshape(batch, length, groups, group_size)
+    dynamic = dynamic.reshape(batch, length, base.shape[0], groups, 1)
+    output = mx.zeros_like(blocks)
+    for offset in range(base.shape[0]):
+        values = (
+            blocks
+            if offset == 0
+            else mx.concatenate(
+                (mx.zeros_like(blocks[:, :offset]), blocks[:, :-offset]), axis=1
+            )
+        )
+        kernel = base[offset].reshape(1, 1, groups, group_size).astype(hidden.dtype)
+        output = output + kernel * values
+        output = output + dynamic[:, :, offset] * values
+    return output.reshape(hidden.shape)
+
+
+class GroupedDynamicCausalConv(nn.Module):
+    def __init__(self, hidden_size, kernel_size, group_size):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.group_size = group_size
+        groups = hidden_size // group_size
+        self.base_kernel = mx.zeros((2, kernel_size, hidden_size))
+        self.kernel_projection = nn.Linear(
+            hidden_size, 2 * kernel_size * groups, bias=False
+        )
+
+    def prepare(self, hidden):
+        groups = hidden.shape[-1] // self.group_size
+        dynamic = self.kernel_projection(hidden).reshape(
+            *hidden.shape[:-1], 2, self.kernel_size, groups
+        )
+        return (
+            _grouped_dynamic_convolve(
+                hidden, dynamic[..., 0, :, :], self.base_kernel[0], self.group_size
+            ),
+            dynamic[..., 1, :, :],
+        )
+
+    def finish(self, hidden, dynamic):
+        return _grouped_dynamic_convolve(
+            hidden, dynamic, self.base_kernel[1], self.group_size
+        )
+
+
+class DFlash2DecoderLayer(DFlashDecoderLayer):
+    def __init__(self, config: DFlashConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.attention_conv = GroupedDynamicCausalConv(
+            config.hidden_size, config.conv_kernel_size, config.conv_group_size
+        )
+        self.mlp_conv = GroupedDynamicCausalConv(
+            config.hidden_size, config.conv_kernel_size, config.conv_group_size
+        )
+
+    def __call__(self, x, x_ctx, rope, cache):
+        residual = x
+        x, kernel = self.attention_conv.prepare(self.input_layernorm(x))
+        x = residual + self.attention_conv.finish(
+            self.self_attn(x, x_ctx, rope, cache), kernel
+        )
+        residual = x
+        x, kernel = self.mlp_conv.prepare(self.post_attention_layernorm(x))
+        return residual + self.mlp_conv.finish(self.mlp(x), kernel)
+
+
+class CandidateSelector(nn.Module):
+    def __init__(self, config: DFlashConfig):
+        super().__init__()
+        self.top_k = config.selector_top_k
+        self.predecessor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.successor_codebook = nn.Embedding(config.vocab_size, config.selector_rank)
+        self.hidden_projection = nn.Linear(
+            config.hidden_size, config.selector_rank, bias=False
+        )
+
+    def select(self, hidden, logits, anchor_ids, sampler=None):
+        candidates = mx.argpartition(logits, -self.top_k, axis=-1)[..., -self.top_k :]
+        unary = mx.take_along_axis(logits, candidates, axis=-1)
+        hidden = self.hidden_projection(hidden)
+        predecessor = anchor_ids
+        path = []
+        for position in range(hidden.shape[1]):
+            edges = mx.sum(
+                self.predecessor_codebook(predecessor)[:, None]
+                * hidden[:, position, None]
+                * self.successor_codebook(candidates[:, position]),
+                axis=-1,
+            )
+            scores = unary[:, position] + edges
+            if sampler is not None:
+                selected = sampler(scores)
+            else:
+                selected = mx.argmax(scores, axis=-1)
+            predecessor = mx.take_along_axis(
+                candidates[:, position], selected[:, None], axis=-1
+            )[:, 0]
+            path.append(predecessor)
+        return mx.stack(path, axis=1), candidates
+
+
 class DFlashDraftModel(nn.Module):
+    layer_class = DFlashDecoderLayer
+
     def __init__(self, config: DFlashConfig):
         super().__init__()
         self.config = config
@@ -127,7 +234,7 @@ class DFlashDraftModel(nn.Module):
         self.fc = nn.Linear(concat_dim, config.hidden_size, bias=False)
         self.hidden_norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.layers = [
-            DFlashDecoderLayer(config, i) for i in range(config.num_hidden_layers)
+            self.layer_class(config, i) for i in range(config.num_hidden_layers)
         ]
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = _build_rope(config)
@@ -255,6 +362,55 @@ class DFlashDraftModel(nn.Module):
                 k = k[len("model.") :]
             out[k] = v
         return out
+
+
+class DFlash2DraftModel(DFlashDraftModel):
+    layer_class = DFlash2DecoderLayer
+
+    def __init__(self, config: DFlashConfig):
+        super().__init__(config)
+        self.candidate_selector = CandidateSelector(config)
+
+    def draft_block(
+        self,
+        last_bonus,
+        hidden: mx.array,
+        cache: List[KVCache],
+        block_size: int,
+        sampler,
+        token_dtype: mx.Dtype = mx.int32,
+    ) -> mx.array:
+        mask_id = int(self.config.mask_token_id)
+        if isinstance(last_bonus, int):
+            block = mx.array(
+                [[last_bonus] + [mask_id] * (block_size - 1)],
+                dtype=token_dtype,
+            )
+            anchor = mx.array([last_bonus], dtype=token_dtype)
+        else:
+            B = last_bonus.shape[0]
+            masks = mx.full((B, block_size - 1), mask_id, dtype=token_dtype)
+            block = mx.concatenate(
+                [last_bonus[:, None].astype(token_dtype), masks], axis=1
+            )
+            anchor = last_bonus.astype(token_dtype)
+        draft_hidden = self._hidden(block, hidden, cache)[:, 1:]
+        tokens, _ = self.candidate_selector.select(
+            draft_hidden, self._logits(draft_hidden), anchor, sampler=sampler
+        )
+        return tokens.astype(token_dtype)
+
+    def sanitize(self, weights: dict) -> dict:
+        out = super().sanitize(weights)
+        remapped = {}
+        for k, v in out.items():
+            if k in (
+                "candidate_selector.predecessor_codebook",
+                "candidate_selector.successor_codebook",
+            ):
+                k = f"{k}.weight"
+            remapped[k] = v
+        return remapped
 
 
 DFlashKVCache = KVCache

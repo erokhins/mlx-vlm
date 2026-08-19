@@ -1,5 +1,5 @@
 from ..qwen3_dflash.config import DFlashConfig
-from ..qwen3_dflash.dflash import DFlashDraftModel, DFlashKVCache
+from ..qwen3_dflash.dflash import DFlash2DraftModel, DFlashDraftModel, DFlashKVCache
 
 
 class Gemma4DFlashConfig(DFlashConfig):
@@ -18,12 +18,22 @@ class Gemma4DFlashDraftModel(DFlashDraftModel):
     pass
 
 
-Model = Gemma4DFlashDraftModel
+class Gemma4DFlash2DraftModel(DFlash2DraftModel):
+    pass
+
+
+def Model(config):
+    if getattr(config, "is_dflash2", False):
+        return Gemma4DFlash2DraftModel(config)
+    return Gemma4DFlashDraftModel(config)
+
+
 ModelConfig = Gemma4DFlashConfig
 
 __all__ = [
     "Gemma4DFlashConfig",
     "Gemma4DFlashDraftModel",
+    "Gemma4DFlash2DraftModel",
     "DFlashKVCache",
     "Model",
     "ModelConfig",
