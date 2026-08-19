@@ -192,6 +192,7 @@ for i in range(B):
 | Target | Drafter | Notes |
 |--------|---------|-------|
 | `Qwen/Qwen3.5-4B` | `z-lab/Qwen3.5-4B-DFlash` | Text + image. ~2.5× speedup on code/reasoning. |
+| `mlx-community/Qwen3.8-27B-4bit` | `z-lab/Qwen3.8-27B-DFlash2` | DFlash 2. Auto-detected from `architectures`. Prefer `--draft-block-size 5` for 4-bit targets. |
 | `MiniMaxAI/MiniMax-M3` | `Inferact/MiniMax-M3-EAGLE3` | Text, image, and video target. Uses `--draft-kind eagle3`. |
 
 The drafter is loaded via the shared `load_model` path. DFlash checkpoints are

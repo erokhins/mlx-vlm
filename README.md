@@ -150,7 +150,7 @@ See [docs/usage.md](docs/usage.md) for Python API examples including batch gener
 
 #### DFlash (Qwen3.5)
 
-A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster.
+A lightweight block-diffusion drafter that predicts multiple tokens per round, typically 2–3× faster. DFlash 2 checkpoints (`architectures: DFlash2DraftModel`) are auto-detected and use a 2-tap dynamic convolution plus a top-k path selector; the verify loop is unchanged.
 
 ```sh
 # Text generation with speculative decoding
@@ -158,6 +158,12 @@ mlx_vlm.generate --model Qwen/Qwen3.5-4B \
   --draft-model z-lab/Qwen3.5-4B-DFlash \
   --prompt "Write a quicksort in Python." \
   --max-tokens 512 --temperature 0 --enable-thinking
+
+# DFlash 2 (Qwen3.8)
+mlx_vlm.generate --model mlx-community/Qwen3.8-27B-4bit \
+  --draft-model z-lab/Qwen3.8-27B-DFlash2 \
+  --prompt "Write a quicksort in Python." \
+  --max-tokens 512 --temperature 0 --draft-block-size 5
 
 # Also works with images
 mlx_vlm.generate --model Qwen/Qwen3.5-4B \

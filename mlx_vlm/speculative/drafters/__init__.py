@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Any, Optional, Tuple
 
-from .qwen3_dflash import DFlashDraftModel
+from .qwen3_dflash import DFlash2DraftModel, DFlashDraftModel
 
 KNOWN_DRAFTER_KINDS = {"dflash", "mtp", "eagle3"}
 
@@ -154,6 +154,7 @@ def load_drafter(
 
 __all__ = [
     "DFlashDraftModel",
+    "DFlash2DraftModel",
     "KNOWN_DRAFTER_KINDS",
     "DRAFTER_KIND_BY_MODEL_TYPE",
     "DEFAULT_DRAFTER_KIND",

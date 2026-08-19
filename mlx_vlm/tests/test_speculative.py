@@ -56,7 +56,16 @@ from mlx_vlm.speculative.drafters.glm4_moe_lite_mtp.split import split_glm4_moe_
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import ModelConfig as Qwen3_5MTPConfig
 from mlx_vlm.speculative.drafters.qwen3_5_mtp import Qwen3_5MTPDraftModel
 from mlx_vlm.speculative.drafters.qwen3_5_mtp.split import split_qwen3_5_mtp
-from mlx_vlm.speculative.drafters.qwen3_dflash import DFlashDraftModel, ModelConfig
+from mlx_vlm.speculative.drafters.qwen3_dflash import (
+    DFlash2DraftModel,
+    DFlashDraftModel,
+    Model,
+    ModelConfig,
+)
+from mlx_vlm.speculative.drafters.qwen3_dflash.dflash import (
+    CandidateSelector,
+    _grouped_dynamic_convolve,
+)
 from mlx_vlm.speculative.eagle3 import (
     _eagle3_block_settings,
     _eagle3_next_block_size,
@@ -2138,6 +2147,207 @@ def test_dflash_config_parses_sliding_attention_metadata():
     assert config.sliding_window == 16
     assert config.final_logit_softcapping == 30.0
     assert config.mask_token_id == 4
+
+
+def _tiny_dflash2_config(**overrides) -> ModelConfig:
+    params = dict(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+        block_size=4,
+        mask_token_id=0,
+        conv_kernel_size=2,
+        conv_group_size=2,
+        selector_rank=2,
+        selector_top_k=2,
+        architectures=["DFlash2DraftModel"],
+    )
+    params.update(overrides)
+    return ModelConfig(**params)
+
+
+def test_dflash2_config_parses_nested_checkpoint_fields():
+    config = ModelConfig.from_dict(
+        {
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": 4,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "vocab_size": 8,
+            "dflash_config": {
+                "block_size": 8,
+                "conv_group_size": 16,
+                "conv_kernel_size": 2,
+                "mask_token_id": 7,
+                "selector_rank": 256,
+                "selector_top_k": 16,
+                "target_layer_ids": [5, 19, 33],
+            },
+        }
+    )
+
+    assert config.is_dflash2
+    assert config.block_size == 8
+    assert config.conv_group_size == 16
+    assert config.conv_kernel_size == 2
+    assert config.mask_token_id == 7
+    assert config.selector_rank == 256
+    assert config.selector_top_k == 16
+    assert config.target_layer_ids == [5, 19, 33]
+
+
+def test_dflash_config_without_selector_is_not_dflash2():
+    config = ModelConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_hidden_layers=0,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=4,
+        vocab_size=8,
+        target_layer_ids=[0],
+    )
+
+    assert not config.is_dflash2
+    assert isinstance(Model(config), DFlashDraftModel)
+    assert not isinstance(Model(config), DFlash2DraftModel)
+
+
+def test_dflash2_model_factory_selects_dflash2_class():
+    model = Model(_tiny_dflash2_config())
+
+    assert isinstance(model, DFlash2DraftModel)
+    assert hasattr(model.layers[0], "attention_conv")
+    assert hasattr(model.layers[0], "mlp_conv")
+    assert hasattr(model, "candidate_selector")
+
+
+def test_grouped_dynamic_convolve_is_causal_and_uses_base_taps():
+    hidden = mx.arange(8, dtype=mx.float32).reshape(1, 2, 4)
+    dynamic = mx.zeros((1, 2, 2, 2), dtype=mx.float32)
+    identity = mx.stack(
+        [mx.ones((4,), dtype=mx.float32), mx.zeros((4,), dtype=mx.float32)]
+    )
+    lagged = mx.stack(
+        [mx.zeros((4,), dtype=mx.float32), mx.ones((4,), dtype=mx.float32)]
+    )
+
+    current = _grouped_dynamic_convolve(hidden, dynamic, identity, group_size=2)
+    previous = _grouped_dynamic_convolve(hidden, dynamic, lagged, group_size=2)
+
+    assert current.tolist() == hidden.tolist()
+    assert previous.tolist() == [[[0.0, 0.0, 0.0, 0.0], [0.0, 1.0, 2.0, 3.0]]]
+
+
+def test_candidate_selector_follows_unary_scores_when_edges_are_zero():
+    config = _tiny_dflash2_config(num_hidden_layers=0)
+    selector = CandidateSelector(config)
+    selector.predecessor_codebook.weight = mx.zeros((8, 2), dtype=mx.float32)
+    selector.successor_codebook.weight = mx.zeros((8, 2), dtype=mx.float32)
+    selector.hidden_projection.weight = mx.zeros((2, 4), dtype=mx.float32)
+
+    logits = mx.array(
+        [
+            [
+                [0.0, 1.0, 0.0, 3.0, 0.0, 2.0, 0.0, 0.0],
+                [0.0, 4.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+            ]
+        ],
+        dtype=mx.float32,
+    )
+    hidden = mx.ones((1, 2, 4), dtype=mx.float32)
+    path, candidates = selector.select(
+        hidden, logits, mx.array([0], dtype=mx.int32)
+    )
+
+    assert sorted(candidates[0, 0].tolist()) == [3, 5]
+    assert sorted(candidates[0, 1].tolist()) == [1, 4]
+    assert path.tolist() == [[3, 4]]
+
+
+def test_candidate_selector_can_override_unary_with_path_score():
+    config = _tiny_dflash2_config(num_hidden_layers=0)
+    selector = CandidateSelector(config)
+    pred = mx.zeros((8, 2), dtype=mx.float32)
+    succ = mx.zeros((8, 2), dtype=mx.float32)
+    pred[1] = mx.array([1.0, 0.0], dtype=mx.float32)
+    succ[5] = mx.array([10.0, 0.0], dtype=mx.float32)
+    selector.predecessor_codebook.weight = pred
+    selector.successor_codebook.weight = succ
+    selector.hidden_projection.weight = mx.array(
+        [[1.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]], dtype=mx.float32
+    )
+
+    logits = mx.array(
+        [[[0.0, 0.0, 0.0, 3.0, 0.0, 2.0, 0.0, 0.0]]],
+        dtype=mx.float32,
+    )
+    hidden = mx.array([[[1.0, 0.0, 0.0, 0.0]]], dtype=mx.float32)
+    path, _ = selector.select(hidden, logits, mx.array([1], dtype=mx.int32))
+
+    assert path.tolist() == [[5]]
+
+
+def test_dflash2_sanitize_renames_codebook_weights():
+    out = DFlash2DraftModel(_tiny_dflash2_config()).sanitize(
+        {
+            "model.fc.weight": mx.ones((2, 4)),
+            "candidate_selector.predecessor_codebook": mx.ones((8, 2)),
+            "candidate_selector.successor_codebook": mx.ones((8, 2)),
+        },
+    )
+
+    assert "fc.weight" in out
+    assert "candidate_selector.predecessor_codebook.weight" in out
+    assert "candidate_selector.successor_codebook.weight" in out
+    assert "candidate_selector.predecessor_codebook" not in out
+
+
+def test_dflash2_draft_block_returns_selected_path_tokens():
+    class Embed:
+        def __call__(self, inputs):
+            return mx.ones((*inputs.shape, 4), dtype=mx.float32)
+
+        def as_linear(self, hidden):
+            return mx.broadcast_to(
+                mx.arange(8, dtype=mx.float32).reshape(1, 1, 8),
+                (*hidden.shape[:2], 8),
+            )
+
+    drafter = DFlash2DraftModel(_tiny_dflash2_config())
+    drafter.candidate_selector.predecessor_codebook.weight = mx.zeros(
+        (8, 2), dtype=mx.float32
+    )
+    drafter.candidate_selector.successor_codebook.weight = mx.zeros(
+        (8, 2), dtype=mx.float32
+    )
+    drafter.candidate_selector.hidden_projection.weight = mx.zeros(
+        (2, 4), dtype=mx.float32
+    )
+    drafter.bind(
+        SimpleNamespace(model=SimpleNamespace(embed_tokens=Embed(), embed_scale=1.0))
+    )
+
+    hidden = mx.zeros((1, 2, 4), dtype=mx.float32)
+    tokens = drafter.draft_block(
+        1,
+        hidden,
+        drafter.make_cache(),
+        3,
+        lambda logits: mx.argmax(logits, axis=-1),
+    )
+
+    assert tokens.shape == (1, 2)
+    assert tokens.dtype == mx.int32
+    assert tokens.tolist() == [[7, 7]]
 
 
 def test_effective_mtp_block_size_respects_requested_block_size():
