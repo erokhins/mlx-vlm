@@ -1,10 +1,10 @@
 """Tests for pinning the stable Junie prompt prefix in APC.
 
-The chat endpoint finds the prefix boundary (everything before the
-"## ISSUE DESCRIPTION" user message), maps it to a verified token
-position, and the prefill harvest pins that snapshot in memory and
-persists it to the APC disk tier — warm-start straight from live
-traffic, with no seed request file.
+The chat endpoint finds the stable prefix boundary before compressed
+history and the "## ISSUE DESCRIPTION" user message, maps it to a verified
+token position, and the prefill harvest pins that snapshot in memory and
+persists it to the APC disk tier — warm-start straight from live traffic,
+with no seed request file.
 """
 
 import mlx.core as mx
@@ -42,13 +42,52 @@ def _junie_messages():
     ]
 
 
+def _compacted_junie_messages():
+    messages = _junie_messages()
+    return messages[:2] + [
+        {
+            "role": "user",
+            "content": (
+                "History processor: The current session included prior "
+                "operations, but the history has been compressed."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "History processor: During the current session, you worked "
+                "on the following <previous_issue>...</previous_issue>."
+            ),
+        },
+    ] + messages[2:]
+
+
 def test_stable_prefix_stops_at_issue_description():
     messages = _junie_messages()
     assert stable_prefix_messages(messages) == messages[:2]
 
 
+def test_stable_prefix_excludes_compacted_history():
+    messages = _compacted_junie_messages()
+    assert stable_prefix_messages(messages) == messages[:2]
+
+
+def test_boundary_probe_excludes_compacted_history():
+    messages = _compacted_junie_messages()
+    assert boundary_probe_messages(messages) == messages[:2] + [
+        {"role": "user", "content": PIN_BOUNDARY_SENTINEL}
+    ]
+
+
 def test_stable_prefix_requires_an_issue_message():
     messages = [m for m in _junie_messages() if "## ISSUE" not in m["content"]]
+    assert stable_prefix_messages(messages) is None
+
+    messages = [
+        m
+        for m in _compacted_junie_messages()
+        if "## ISSUE" not in m["content"]
+    ]
     assert stable_prefix_messages(messages) is None
 
     # A leading issue message leaves no stable prefix to pin.
